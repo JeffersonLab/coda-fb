@@ -22,6 +22,7 @@ A high-performance, multi-threaded frame aggregator for Jefferson Lab's CODA Dat
   - [Output Modes](#output-modes)
 - [Configuration](#configuration)
   - [ET Connection Modes](#et-connection-modes)
+  - [ET System Setup](#et-system-setup)
   - [Threading and Performance](#threading-and-performance)
 - [Troubleshooting](#troubleshooting)
 - [Architecture & Notes](#architecture--notes)
@@ -367,6 +368,115 @@ Connects directly to IP address. Useful when DNS unavailable or for explicit con
 **ET Station Configuration:**
 
 The ET station must be configured for **PARALLEL** mode to support multiple builder threads. Each builder thread creates its own attachment for lock-free operation.
+
+### ET System Setup
+
+Before using ET output mode, you must start an ET system. The ET system acts as a shared memory ring buffer for inter-process communication.
+
+#### Starting ET System
+
+**Basic startup:**
+```bash
+et_start -f /tmp/et_sys_coda -n 1000 -s 2000000
+```
+
+**Production startup with verbose output:**
+```bash
+et_start -f /tmp/et_vgexpid_ERSAP -v -d -n 1000 -s 1000000 -p 23911
+```
+
+#### ET Command-Line Options
+
+```
+-f <filename>        ET system file name (required)
+                     This is a logical name, not a filesystem path
+                     Example: /tmp/et_sys_coda, /tmp/et_vgexpid_ERSAP
+
+-n <events>          Number of events in the ET system (default: 100)
+                     More events = more buffering capacity
+                     Typical: 1000-10000 for production
+
+-s <size>            Event size in bytes (default: 1MB)
+                     Must accommodate largest expected frame
+                     Typical: 1000000 (1MB) to 10000000 (10MB)
+
+-p <port>            TCP server port (default: auto-select)
+                     Required for remote connections
+                     Typical: 11111, 23911, or custom
+
+-v                   Verbose output (print configuration details)
+
+-d                   Run as daemon (detach from terminal)
+
+-g <groups>          Number of event groups (default: 1)
+
+-m                   Enable multicast for remote discovery
+```
+
+#### ET System Sizing Guidelines
+
+**Event count (-n):**
+- Small systems: 100-500 events
+- Medium systems: 1000-2000 events
+- Large systems: 5000-10000 events
+- Rule of thumb: 10-20× the number of concurrent producers/consumers
+
+**Event size (-s):**
+- Must be larger than the largest expected aggregated frame
+- Include overhead: add 20-30% to max frame size
+- Examples:
+  - `-s 1000000` (1 MB) for small frames
+  - `-s 2000000` (2 MB) for typical CODA frames
+  - `-s 10000000` (10 MB) for large multi-stream aggregations
+
+**Port selection (-p):**
+- Use explicit port for remote connections
+- Common ports: 11111, 23911, or any available port > 1024
+- Omit for local-only connections (uses broadcast discovery)
+
+#### Example Configurations
+
+**Local development:**
+```bash
+# Small local ET for testing
+et_start -f /tmp/et_test -v -n 500 -s 1000000
+```
+
+**Production DAQ:**
+```bash
+# Large ET system for high-rate data acquisition
+et_start -f /tmp/et_coda_prod -v -d -n 5000 -s 5000000 -p 11111
+```
+
+**Remote ET server:**
+```bash
+# ET system accessible from remote hosts
+et_start -f /tmp/et_sys_remote -v -d -n 2000 -s 2000000 -p 23911 -m
+```
+
+#### Monitoring ET System
+
+Check ET system status:
+```bash
+et_monitor -f /tmp/et_sys_coda
+```
+
+Monitor with refresh:
+```bash
+et_monitor -f /tmp/et_sys_coda -p 1  # Update every 1 second
+```
+
+#### Stopping ET System
+
+```bash
+# Graceful shutdown (after consumers disconnect)
+et_kill -f /tmp/et_sys_coda
+
+# Force shutdown
+killall et_start
+```
+
+**Note:** Always stop coda-fb and other consumers before killing the ET system to avoid losing data in flight.
 
 ### Threading and Performance
 
