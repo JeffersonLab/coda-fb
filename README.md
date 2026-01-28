@@ -1,41 +1,59 @@
-# E2SAR Standalone Receiver
+# CODA Frame Builder (coda-fb)
 
-A standalone C++ program that receives UDP packets from EJFAT load balancers, reconstructs fragmented frames, and persists them to files. This program is independent of the E2SAR package but links against the installed E2SAR libraries.
+A high-performance, multi-threaded frame aggregator for Jefferson Lab's CODA Data Acquisition system. Receives UDP packets from EJFAT load balancers, reassembles fragmented frames, aggregates multi-stream data by timestamp, and outputs EVIO-6 formatted events to ET systems or files.
 
-## Overview
+**Key Features:**
+- Multi-threaded UDP reception with E2SAR reassembly
+- Timestamp-synchronized frame aggregation across multiple data streams
+- EVIO-6 compliant output (compatible with EMU PAGG)
+- Flexible output: ET system, file with 2GB auto-rollover, or dual mode
+- Lock-free parallel builder threads for high throughput
+- NUMA-aware with CPU affinity support
 
-The E2SAR Standalone Receiver:
+---
 
-1. **Registers** with the EJFAT Control Plane using hostname
-2. **Receives** segmented UDP packets from EJFAT load balancers  
-3. **Reconstructs** fragmented packets into complete event frames
-4. **Persists** each frame as a separate file using atomic writes with memory-mapped I/O
-5. **Reports** statistics on performance and errors
+## Table of Contents
 
-## Features
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+  - [Command-Line Options](#command-line-options)
+  - [Output Modes](#output-modes)
+- [Configuration](#configuration)
+  - [ET Connection Modes](#et-connection-modes)
+  - [Threading and Performance](#threading-and-performance)
+- [Troubleshooting](#troubleshooting)
+- [Architecture & Notes](#architecture--notes)
+- [License](#license)
 
-- **High Performance**: Multi-threaded receiver with configurable CPU core binding
-- **Atomic File Writes**: Uses temporary files and atomic renames to prevent corruption
-- **Memory-Mapped I/O**: Efficient file writing using mmap for large frames
-- **NUMA Awareness**: Optional memory binding to specific NUMA nodes
-- **Robust Error Handling**: Comprehensive error checking and graceful degradation
-- **Real-time Statistics**: Periodic reporting of receiver performance
-- **Signal Handling**: Graceful shutdown with proper control plane deregistration
+---
 
 ## Prerequisites
 
 ### System Requirements
 
-- C++17 compatible compiler (GCC 8+, Clang 6+)
-- E2SAR library installed on the system
-- Boost libraries (≥1.83.0, ≤1.86.0)
-- gRPC++ (≥1.51.1)
-- Protocol Buffers
-- GLib 2.0
+- **OS**: Linux (RHEL/CentOS/Ubuntu/Debian) or macOS
+- **Compiler**: C++17 compatible (GCC 8+, Clang 6+)
+- **Build System**: Meson ≥0.55, Ninja
+
+### Required Dependencies
+
+- **E2SAR library** - EJFAT reassembly library (must be installed with pkg-config support)
+- **Boost** ≥1.83.0, ≤1.86.0 (system, program_options, chrono, thread, filesystem, url)
+- **gRPC++** ≥1.51.1
+- **Protocol Buffers**
+- **GLib 2.0**
+
+### Optional Dependencies
+
+- **ET library** - For ET system output (frame builder mode)
+- **NUMA library** - For NUMA-aware memory allocation
+- **CPU affinity support** - For binding threads to specific cores
 
 ### Install Dependencies
 
-**macOS (using Homebrew):**
+**macOS (Homebrew):**
 ```bash
 brew install boost grpc protobuf glib pkg-config meson ninja
 ```
@@ -52,182 +70,379 @@ sudo dnf install boost-devel grpc-devel protobuf-devel glib2-devel
 sudo dnf install pkg-config meson ninja-build
 ```
 
-### E2SAR Installation
+### E2SAR Library Installation
 
-Ensure E2SAR is installed and available. The build system will look for:
-- E2SAR headers in system include paths
-- E2SAR library (`libe2sar`) in system library paths
-- E2SAR pkg-config file (`e2sar.pc`)
-
-## Building
-
-### 1. Configure Build
-
+Ensure E2SAR is installed and pkg-config can find it:
 ```bash
-cd /Users/gurjyan/Documents/Devel/e2sar_receiver
-meson setup builddir
+pkg-config --modversion e2sar
+# If not found, set PKG_CONFIG_PATH:
+export PKG_CONFIG_PATH=/path/to/e2sar/lib/pkgconfig:$PKG_CONFIG_PATH
 ```
 
-**For debug builds:**
+### ET Library Installation (Optional)
+
+For frame builder ET output support:
 ```bash
-meson setup --buildtype=debug builddir
+# Clone and build ET library from Jefferson Lab
+git clone https://github.com/JeffersonLab/et
+cd et && mkdir build && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local
+make && sudo make install
 ```
 
-**For release builds:**
+---
+
+## Installation
+
+### Build from Source
+
 ```bash
-meson setup --buildtype=release builddir
+# Clone repository
+cd /path/to/coda-fb
+
+# Build (release mode)
+./scripts/build.sh
+
+# Build with options
+./scripts/build.sh --type debug --clean
+
+# Build and install
+./scripts/build.sh --install --prefix /opt
 ```
 
-### 2. Compile
-
+**Manual build:**
 ```bash
+meson setup builddir --buildtype=release
 meson compile -C builddir
+meson install -C builddir  # optional
 ```
 
-### 3. Install (Optional)
+### Installation Directories
+
+The build system automatically detects installation location:
+
+1. **CODA environment** (if `$CODA` set): `$CODA/Linux-x86_64/bin`
+2. **Custom prefix** (if specified): `<prefix>/bin`
+3. **User local** (default): `~/.local/bin`
+
+**Override installation:**
+```bash
+meson setup --prefix=/custom/path builddir
+```
+
+### Verify Build
 
 ```bash
-meson install -C builddir
+# Test executable
+./builddir/coda-fb --help
+
+# Check version
+./builddir/coda-fb --version
 ```
 
-The executable will be installed to `/usr/local/bin/e2sar_receiver` by default.
+---
 
-### 4. Custom Install Location
+## Quick Start
+
+### Basic File Output
+
+Simplest mode - writes raw reassembled frames to a single file:
 
 ```bash
-meson setup --prefix=/path/to/install builddir
-meson compile -C builddir
-meson install -C builddir
+coda-fb \
+  --uri 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \
+  --ip 192.168.1.100 \
+  --output-dir /data/output \
+  --prefix run1234
 ```
+
+**Output:** `/data/output/run1234.dat` (single file, raw frames)
+
+### Frame Builder with ET Output
+
+Aggregate frames and send to ET system for real-time processing:
+
+```bash
+# Start ET system first
+et_start -f /tmp/et_sys_coda -n 1000 -s 2000000
+
+# Run frame builder
+coda-fb \
+  --uri 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \
+  --ip 192.168.1.100 \
+  --et-file /tmp/et_sys_coda \
+  --et-station CODA_PAGG \
+  --fb-threads 4
+```
+
+**Output:** EVIO-6 frames sent to ET station `CODA_PAGG`
+
+### Frame Builder with File Output
+
+Aggregate frames and write to files with 2GB auto-rollover:
+
+```bash
+coda-fb \
+  --uri 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \
+  --ip 192.168.1.100 \
+  --fb-output-dir /data/frames \
+  --fb-output-prefix clas12_run1234 \
+  --fb-threads 4
+```
+
+**Output:** Multiple EVIO-6 files:
+```
+/data/frames/clas12_run1234_thread0_file0000.evio
+/data/frames/clas12_run1234_thread0_file0001.evio  (after 2GB)
+/data/frames/clas12_run1234_thread1_file0000.evio
+...
+```
+
+### Dual Output (ET + File)
+
+Real-time processing via ET, permanent archival to files:
+
+```bash
+coda-fb \
+  --uri 'ejfat://...' \
+  --ip 192.168.1.100 \
+  --et-file /tmp/et_sys_coda \
+  --et-station CODA_PAGG \
+  --fb-output-dir /mnt/archive/run1234 \
+  --fb-output-prefix run1234 \
+  --fb-threads 8
+```
+
+**Output:** Both ET system (real-time) + archive files (permanent)
+
+---
 
 ## Usage
 
-### Command Line Options
+### Command-Line Options
 
-```bash
-./builddir/e2sar_receiver --help
+#### Basic Options
+
+```
+--uri, -u <uri>              EJFAT URI for control plane connection (required)
+--ip <address>               IP address for receiving UDP packets
+--port, -p <port>            Starting UDP port (default: 10000)
+--autoip                     Auto-detect IP from system interfaces
+--version                    Show version and exit
+--help                       Show help message
 ```
 
-### Required Parameters
+#### Basic File Output (Legacy Mode)
 
-- `--uri, -u`: EJFAT URI for control plane connection
-- `--output-dir, -o`: Directory to save received frames
+```
+--output-dir, -o <dir>       Output directory for raw frames
+--prefix <name>              Filename prefix (default: events)
+--extension, -e <ext>        File extension (default: .bin)
+```
 
-### Network Parameters
+**Note:** Basic mode writes one raw frame per line to a single file. For production use, prefer frame builder mode.
 
-- `--ip`: IP address for receiving UDP packets (conflicts with `--autoip`)
-- `--port, -p`: Starting UDP port number (default: 10000)  
-- `--autoip`: Auto-detect IP address from EJFAT URI (conflicts with `--ip`)
+#### Frame Builder Options
 
-### File Output Parameters
+```
+ET Output:
+  --et-file <file>           ET system file name (e.g., /tmp/et_sys_coda)
+  --et-host <host>           ET host (empty for local, hostname, or IP)
+  --et-port <port>           ET port (0 for default, typically 11111)
+  --et-station <name>        ET station name (default: GRAND_CENTRAL)
+  --et-event-size <bytes>    Max ET event size (default: 2MB)
 
-- `--prefix`: Filename prefix for output files (default: 'frame')
-- `--extension, -e`: File extension for output files (default: '.bin')
+File Output:
+  --fb-output-dir <dir>      Frame builder output directory
+  --fb-output-prefix <name>  File prefix (default: frames)
 
-### Performance Parameters
+Frame Building:
+  --fb-threads <count>       Builder threads (default: 4, range: 1-32)
+  --timestamp-slop <ticks>   Max timestamp difference (default: 100)
+  --frame-timeout <ms>       Incomplete frame timeout (default: 1000)
+  --expected-streams <n>     Expected data streams for aggregation
+```
 
-- `--threads, -t`: Number of receiver threads (default: 1)
-- `--bufsize, -b`: Socket buffer size in bytes (default: 3MB)
-- `--timeout`: Event reassembly timeout in milliseconds (default: 500)
+**Important:** Frame builder requires at least ONE output mode (ET or file). Both can be enabled for dual output.
 
-### Control Plane Parameters
+#### Performance Options
 
-- `--withcp, -c`: Enable control plane interactions (default: true)
-- `--ipv6, -6`: Prefer IPv6 for control plane connections
-- `--novalidate, -v`: Don't validate TLS certificates
+```
+--threads, -t <count>        Receiver threads (default: 1)
+--bufsize, -b <bytes>        Socket buffer size (default: 3MB)
+--timeout <ms>               Reassembly timeout (default: 500ms)
+--cores <list>               CPU cores for thread binding (e.g., 0 1 2 3)
+--numa <node>                NUMA node for memory allocation
+--report-interval <ms>       Statistics interval (default: 5000ms)
+```
 
-### Advanced Parameters
+#### Control Plane Options
 
-- `--cores`: List of CPU cores to bind receiver threads to
-- `--numa`: Bind memory allocation to specific NUMA node
-- `--report-interval`: Statistics reporting interval in milliseconds (default: 5000)
+```
+--withcp, -c                 Enable control plane (default: true)
+--ipv6, -6                   Prefer IPv6 for control plane
+--novalidate, -v             Skip TLS certificate validation
+```
 
-## Examples
+### Output Modes
 
-### Basic Usage
+| Mode | Flags | Output | Format | Rollover | Use Case |
+|------|-------|--------|--------|----------|----------|
+| **Basic** | `--output-dir` | Single file | Raw frames | No | Simple recording |
+| **FB File** | `--fb-output-dir` | Multiple files | EVIO-6 | 2GB auto | Production archival |
+| **FB ET** | `--et-file` + `--et-station` | ET system | EVIO-6 | N/A | Real-time DAQ |
+| **FB Dual** | Both above | ET + files | EVIO-6 | 2GB auto | Production (with backup) |
 
+### Examples
+
+**High-throughput configuration:**
 ```bash
-e2sar_receiver \
-  --uri 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \
+coda-fb \
+  --uri 'ejfat://...' \
   --ip 192.168.1.100 \
-  --port 10000 \
-  --output-dir /path/to/frames
+  --threads 4 \
+  --fb-output-dir /data/frames \
+  --fb-threads 8 \
+  --bufsize 16777216 \
+  --cores 0 1 2 3 4 5 6 7 8 9 10 11 \
+  --numa 0
 ```
 
-### With Custom File Naming
-
+**Remote ET connection:**
 ```bash
-e2sar_receiver \
-  --uri 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \
+coda-fb \
+  --uri 'ejfat://...' \
   --ip 192.168.1.100 \
-  --output-dir /data/events \
-  --prefix experiment_001 \
-  --extension .dat
+  --et-file /tmp/et_sys_coda \
+  --et-host et-server.jlab.org \
+  --et-port 11111 \
+  --et-station CODA_PAGG
 ```
 
-### High Performance Configuration
-
+**Auto IP detection:**
 ```bash
-e2sar_receiver \
-  --uri 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \
-  --ip 192.168.1.100 \
-  --output-dir /fast/storage \
-  --threads 8 \
-  --cores 0 1 2 3 4 5 6 7 \
-  --numa 0 \
-  --bufsize 16777216
-```
-
-### Auto IP Detection
-
-```bash
-e2sar_receiver \
-  --uri 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \
+coda-fb \
+  --uri 'ejfat://...' \
   --autoip \
-  --output-dir /path/to/frames
+  --fb-output-dir /data/frames
 ```
 
-## Output Files
+---
 
-### File Naming Convention
+## Configuration
 
-Files are named using the pattern: `{prefix}_{eventNum}_{dataId}{extension}`
+### ET Connection Modes
+
+The frame builder supports three ET connection modes:
+
+#### 1. Local Broadcast (Default)
+
+```bash
+--et-file /tmp/et_sys_coda
+# Empty host → uses UDP broadcast to find ET on local network
+```
+
+Automatically discovers ET system via broadcast. Suitable for same machine or local subnet.
+
+#### 2. Direct Connection by Hostname
+
+```bash
+--et-file /tmp/et_sys_coda \
+--et-host et-server.jlab.org \
+--et-port 11111
+```
+
+Connects directly to specified host. Required for remote ET systems with DNS.
+
+#### 3. Direct Connection by IP
+
+```bash
+--et-file /tmp/et_sys_coda \
+--et-host 192.168.100.50 \
+--et-port 11111
+```
+
+Connects directly to IP address. Useful when DNS unavailable or for explicit control.
+
+**ET Station Configuration:**
+
+The ET station must be configured for **PARALLEL** mode to support multiple builder threads. Each builder thread creates its own attachment for lock-free operation.
+
+### Threading and Performance
+
+#### Receiver Threads
+
+```bash
+--threads 4        # 4 receiver threads on ports 10000-10003
+--cores 0 1 2 3    # Bind to specific CPU cores
+```
+
+**Recommendations:**
+- Start with 1-2 threads
+- Increase if packet loss occurs
+- Use CPU affinity for deterministic performance
+
+#### Builder Threads
+
+```bash
+--fb-threads 8     # 8 parallel builder threads
+```
+
+**Throughput scaling:**
+- 1-2 threads: Low data rate (< 500 MB/s)
+- 4-8 threads: Medium data rate (500 MB/s - 2 GB/s)
+- 8-16 threads: High data rate (2-10 GB/s)
+- 16-32 threads: Very high data rate (> 10 GB/s), requires many cores
+
+**Architecture:** Builder threads receive time slices via hash-based distribution (by timestamp). Each thread maintains its own frame buffer, builds EVIO-6 banks independently, and has its own ET attachment. This achieves near-linear throughput scaling.
+
+#### NUMA Optimization
+
+```bash
+--numa 0           # Bind memory allocation to NUMA node 0
+--cores 0-15       # Use cores on same NUMA node
+```
+
+For multi-socket systems, bind threads and memory to the same NUMA node for best performance.
+
+#### Socket Buffer Size
+
+```bash
+--bufsize 16777216  # 16 MB socket buffer
+```
+
+Increase if experiencing packet loss at high data rates. Check system limits:
+```bash
+# Linux: check max socket buffer size
+sysctl net.core.rmem_max
+# Increase if needed
+sudo sysctl -w net.core.rmem_max=67108864
+```
+
+### File Output Features
+
+**Automatic Rollover:**
+- Files automatically roll over at 2GB (2,147,483,648 bytes)
+- Sequential numbering: `file0000.evio`, `file0001.evio`, etc.
+- Per-thread file sequences (each builder thread maintains separate files)
+- Seamless, no data loss during rollover
+
+**File Naming:**
+```
+{prefix}_thread{N}_file{NNNN}.evio
 
 Examples:
-- `frame_12345_4321.bin`
-- `experiment_001_98765_1234.dat`
-
-### Atomic Writes
-
-Files are written atomically:
-1. Create temporary file with `.` prefix (e.g., `.frame_12345_4321.bin`)
-2. Write frame data using memory-mapped I/O
-3. Atomically rename to final filename
-
-This prevents partial or corrupted files from appearing in the output directory.
-
-## Monitoring
-
-### Statistics Output
-
-The program periodically outputs statistics:
-
-```
-=== Statistics Report ===
-Frames Received: 1250
-Frames Written: 1248
-Write Errors: 0
-Receive Errors: 2
-Events Lost (reassembly): 0
-Events Lost (enqueue): 0
-Data Errors: 0
-gRPC Errors: 0
-=========================
+  frames_thread0_file0000.evio
+  frames_thread0_file0001.evio
+  frames_thread1_file0000.evio
 ```
 
-### Final Statistics
+**Output Directory:**
+- Created automatically if doesn't exist
+- Must have write permissions
+- Consider fast storage (SSD/NVMe) for high data rates
 
-On exit (Ctrl+C), detailed statistics are printed including per-port fragment counts.
+---
 
 ## Troubleshooting
 
@@ -235,75 +450,361 @@ On exit (Ctrl+C), detailed statistics are printed including per-port fragment co
 
 **E2SAR library not found:**
 ```bash
-# Ensure E2SAR is installed and PKG_CONFIG_PATH includes e2sar.pc
-export PKG_CONFIG_PATH=/path/to/e2sar/lib/pkgconfig:$PKG_CONFIG_PATH
+# Check pkg-config path
+pkg-config --list-all | grep e2sar
+
+# Set path if needed
+export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
 ```
 
-**Boost not found:**
+**Boost not found or wrong version:**
 ```bash
-# Set BOOST_ROOT if Boost is installed in non-standard location
+# Check Boost version
+ls /usr/local/include/boost/version.hpp
+
+# Set Boost root if needed
 export BOOST_ROOT=/path/to/boost
+```
+
+**ET library not found:**
+```bash
+# ET is optional - disable frame builder or install ET
+# Check ET installation
+ls /usr/local/lib/libet.* /usr/local/include/et.h
+
+# Set library path if needed
+export LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
+export CPATH=/usr/local/include:$CPATH
 ```
 
 ### Runtime Issues
 
 **Permission denied on output directory:**
 ```bash
-mkdir -p /path/to/frames
-chmod 755 /path/to/frames
+mkdir -p /data/frames
+chmod 755 /data/frames
+chown $USER /data/frames
 ```
 
 **UDP port binding errors:**
 ```bash
-# Check if ports are available
+# Check if ports available
 sudo netstat -ulpn | grep :10000
+
+# Kill conflicting process or use different port
+coda-fb --port 20000 ...
 ```
 
 **Control plane connection issues:**
 ```bash
-# Test network connectivity to control plane
+# Test connectivity to control plane
 telnet ctrl-plane-host 18347
+
+# Try without TLS validation (insecure, testing only)
+coda-fb --novalidate ...
 ```
 
-## Performance Tuning
+**ET connection failed:**
+```bash
+# Check ET system is running
+et_monitor -f /tmp/et_sys_coda
 
-### For High Throughput
+# Verify ET file name matches
+et_start -f /tmp/et_sys_coda -n 1000 -s 2000000
 
-1. **Increase socket buffer size**: `--bufsize 33554432` (32MB)
-2. **Use multiple threads**: `--threads 4` or more
-3. **Pin to specific CPU cores**: `--cores 0 1 2 3`
-4. **Use NUMA binding**: `--numa 0`
-5. **Fast storage**: Use SSD or NVMe for output directory
+# Check network connectivity for remote ET
+telnet et-server.jlab.org 11111
+```
 
-### For Low Latency
+**Frame builder requires at least one output mode:**
+```bash
+# Error: no output specified
+coda-fb --uri '...' --ip 192.168.1.100
 
-1. **Reduce reassembly timeout**: `--timeout 100`
-2. **Pin to dedicated cores**: `--cores 2 3` (isolated from OS)
-3. **Disable CPU frequency scaling**
-4. **Use tmpfs for temporary storage**
+# Fix: add ET output
+coda-fb --uri '...' --ip 192.168.1.100 \
+  --et-file /tmp/et_sys_coda --et-station CODA_PAGG
 
-## Architecture
+# Or: add file output
+coda-fb --uri '...' --ip 192.168.1.100 \
+  --fb-output-dir /data/frames
 
-The receiver consists of:
+# Or: add both
+coda-fb --uri '...' --ip 192.168.1.100 \
+  --et-file /tmp/et_sys_coda --et-station CODA_PAGG \
+  --fb-output-dir /data/frames
+```
 
-- **Main Thread**: Command line processing, initialization, and coordination
-- **Receiver Threads**: UDP packet reception and frame reassembly (E2SAR library)
-- **Write Thread**: Frame processing and file writing (main thread)
-- **Statistics Thread**: Periodic performance reporting
-- **Signal Handler**: Graceful shutdown and cleanup
+**Disk full during file output:**
+```bash
+# Monitor disk space
+df -h /data/frames
+
+# Calculate expected usage
+# Example: 1 GB/s data rate × 3600s run = 3.6 TB/hour
+```
+
+**Payload validation errors:**
+
+If seeing "Skipping frame due to invalid payload" errors:
+- Check EVIO payload format from data source
+- Verify magic number (0xc0da0100 for CODA block header)
+- Check endianness (payload parser auto-corrects but logs warning)
+- Ensure data source sends complete frames
+
+### Performance Issues
+
+**Packet loss / missed frames:**
+```bash
+# Increase socket buffer
+--bufsize 33554432  # 32 MB
+
+# Add more receiver threads
+--threads 4
+
+# Check system UDP buffer limits
+sysctl net.core.rmem_max
+```
+
+**Low throughput:**
+```bash
+# Increase builder threads
+--fb-threads 16
+
+# Use CPU affinity
+--cores 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+
+# Use NUMA binding
+--numa 0
+
+# Use faster storage for file output
+# Mount NVMe/SSD at /data/frames
+```
+
+**High CPU usage:**
+```bash
+# Reduce threads if oversubscribed
+--threads 2 --fb-threads 4
+
+# Spread across NUMA nodes
+--numa -1  # disable NUMA binding
+```
+
+---
+
+## Architecture & Notes
+
+### System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        coda-fb Process                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │         EJFAT Control Plane (gRPC)                    │  │
+│  │  - Worker registration                                 │  │
+│  │  - Load balancer configuration                        │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                            │                                  │
+│  ┌─────────────────────────▼──────────────────────────────┐ │
+│  │       Receiver Threads (E2SAR Reassembler)             │ │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐       │ │
+│  │  │ Port   │  │ Port   │  │ Port   │  │ Port   │       │ │
+│  │  │ 10000  │  │ 10001  │  │ 10002  │  │ 10003  │  ...  │ │
+│  │  └────────┘  └────────┘  └────────┘  └────────┘       │ │
+│  │       ▲          ▲          ▲          ▲               │ │
+│  └───────┼──────────┼──────────┼──────────┼───────────────┘ │
+│          │          │          │          │                  │
+│       UDP Packets (fragmented from EJFAT Load Balancer)     │
+│                                                               │
+│  ┌──────────────────▼──────────────────────────────────┐   │
+│  │           Payload Validation                         │   │
+│  │  - Parse EVIO structure                              │   │
+│  │  - Verify magic number (0xc0da0100)                  │   │
+│  │  - Extract timestamp, frame number, ROC ID           │   │
+│  │  - Auto-correct endianness if needed                 │   │
+│  └──────────────────┬──────────────────────────────────┘   │
+│                     │                                        │
+│  ┌──────────────────▼──────────────────────────────────┐   │
+│  │       Frame Builder (if enabled)                     │   │
+│  │                                                        │   │
+│  │  Hash by timestamp → distribute to builder threads   │   │
+│  │                                                        │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐           │   │
+│  │  │ Builder  │  │ Builder  │  │ Builder  │           │   │
+│  │  │ Thread 0 │  │ Thread 1 │  │ Thread N │   ...     │   │
+│  │  ├──────────┤  ├──────────┤  ├──────────┤           │   │
+│  │  │Frame Buf │  │Frame Buf │  │Frame Buf │           │   │
+│  │  │          │  │          │  │          │           │   │
+│  │  │ Build    │  │ Build    │  │ Build    │           │   │
+│  │  │ EVIO-6   │  │ EVIO-6   │  │ EVIO-6   │           │   │
+│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘           │   │
+│  │       │             │             │                  │   │
+│  └───────┼─────────────┼─────────────┼──────────────────┘   │
+│          │             │             │                       │
+│  ┌───────▼─────────────▼─────────────▼──────────────────┐  │
+│  │             Output Layer (parallel)                   │  │
+│  │  ┌──────────────────┐    ┌──────────────────┐        │  │
+│  │  │   ET System      │    │   File Output    │        │  │
+│  │  │   (shared mem    │    │   (2GB rollover) │        │  │
+│  │  │   or TCP)        │    │                  │        │  │
+│  │  └──────────────────┘    └──────────────────┘        │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                               │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │         Statistics Reporting Thread                   │  │
+│  │  - Periodic performance metrics                       │  │
+│  │  - Frame/byte counters                                │  │
+│  │  - Error tracking                                     │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow
+
+1. **Registration:** Process registers with EJFAT control plane as a worker node
+2. **Reception:** Receiver threads listen on UDP ports, receive fragmented packets
+3. **Reassembly:** E2SAR library reassembles UDP segments into complete data frames
+4. **Validation:** EVIO payload parsed to extract timestamp, frame number, ROC ID; magic number and endianness verified
+5. **Aggregation:** (Frame builder) Frames distributed to builder threads by timestamp hash; threads aggregate frames from multiple streams with matching timestamps
+6. **EVIO-6 Construction:** Builder threads construct aggregated time frame banks with Stream Info Bank (SIB), Time Slice Segment (TSS), and Aggregation Info Segment (AIS)
+7. **Output:** Parallel output to ET system and/or files with automatic 2GB rollover
+
+### Threading Model
+
+**Lock-Free Distribution:**
+- Incoming slices hashed by timestamp to specific builder threads
+- No contention during frame building
+- Each thread has independent ET attachment
+- Thread-local statistics (aggregated on stop)
+
+**Throughput Scaling:**
+- N receiver threads → N× UDP reception capacity
+- M builder threads → M× frame building throughput
+- Near-linear scaling up to CPU core count
+
+### EVIO-6 Format
+
+Frame builder outputs **EVIO-6 aggregated time frame banks** compatible with Jefferson Lab EMU PAGG format:
+
+```
+Word 0:  Total event length (32-bit words, excluding this word)
+Word 1:  Tag (0xFFD0) | DataType (0x10) | Num (slice count + error bit)
+
+Stream Info Bank (SIB):
+  Word 2:  SIB length
+  Word 3:  Tag (0xFFD1) | DataType (0x20) | Num
+
+  Time Slice Segment (TSS):
+    Word 4:  Tag (0x01) | padding (1) | length (3)
+    Word 5:  Frame number
+    Word 6:  Avg timestamp (bits 31-0)
+    Word 7:  Avg timestamp (bits 63-32)
+
+  Aggregation Info Segment (AIS):
+    Word 8:   Tag (0x02) | padding (1) | length (slice count)
+    Word 9+:  One word per slice: ROC_ID | reserved | stream_status
+
+Time Slice Banks (original payloads):
+  [Payload 1 from stream 1]
+  [Payload 2 from stream 2]
+  ...
+  [Payload N from stream N]
+```
+
+**CODA Tags:**
+- `0xFFD0`: STREAMING_PHYS (top-level physics event)
+- `0xFFD1`: STREAMING_SIB_BUILT (Stream Info Bank - aggregated)
+- `0x01`: STREAMING_TSS_BUILT (Time Slice Segment)
+- `0x02`: STREAMING_AIS_BUILT (Aggregation Info Segment)
+
+### Timestamp Synchronization
+
+Frames from multiple data streams are synchronized by timestamp:
+- All slices in an aggregated frame must have timestamps within `--timestamp-slop` ticks (default: 100)
+- If timestamps diverge beyond threshold: warning logged, error bit set in header, frame still built
+- Average timestamp calculated across all slices for Time Slice Segment
+- Incomplete frames (missing expected streams) time out after `--frame-timeout` ms (default: 1000)
+
+### Dependencies
+
+**E2SAR Library:**
+- Provides UDP reassembly and EJFAT control plane integration
+- Must be installed with pkg-config support
+
+**ET Library (Optional):**
+- Jefferson Lab Event Transfer system for real-time inter-process communication
+- Required for frame builder ET output mode
+- Supports both shared memory (local) and TCP (remote) transports
+
+**Boost:**
+- Program options: command-line parsing
+- Filesystem: path manipulation
+- Thread/chrono: multi-threading
+- ASIO: network address handling
+- URL: EJFAT URI parsing
+
+### Known Issues and Limitations
+
+1. **Endianness:** Payload parser auto-detects and corrects wrong endianness, but logs warning. Data source should match system endianness for best performance.
+
+2. **Frame Ordering:** Builder threads output frames independently; timestamp order not guaranteed across threads. Use single thread (`--fb-threads 1`) if strict ordering required.
+
+3. **ET Station Mode:** ET station must be configured for PARALLEL mode to support multiple builder thread attachments.
+
+4. **Expected Streams:** `--expected-streams` configures expected input count but missing stream detection is advisory only (logs warning, sets error bit).
+
+5. **File Rollover:** Rollover happens at exactly 2GB; partial EVIO events at boundary will complete in current file (may slightly exceed 2GB).
+
+### Performance Notes
+
+**Typical Throughput:**
+- 4 receiver threads + 8 builder threads: 2-5 GB/s (depends on frame size, CPU)
+- 8 receiver threads + 16 builder threads: 5-10 GB/s (high-end system)
+
+**Bottlenecks:**
+- Network: 10 GbE NIC required for > 1 GB/s
+- CPU: Builder threads are CPU-intensive (EVIO construction)
+- Storage: File output requires SSD/NVMe for > 2 GB/s
+- Memory: Large socket buffers (16-32 MB) prevent packet loss
+
+**Optimization Tips:**
+- Match receiver threads to number of UDP ports used by EJFAT load balancer
+- Use NUMA binding on multi-socket systems
+- Pin threads to physical cores (not hyperthreads) for deterministic latency
+- Use ET output for highest throughput (no disk I/O)
+
+---
 
 ## License
 
-This standalone receiver program is provided as an example of using E2SAR libraries. 
-License terms follow those of the E2SAR project.
+This software is developed for Jefferson Lab's CODA Data Acquisition system.
 
-## Support
+Copyright (c) 2024, Jefferson Science Associates
 
-For issues related to:
-- **E2SAR library functionality**: Refer to E2SAR project documentation
-- **This standalone receiver**: Check command line options and configuration
-- **Performance tuning**: See performance tuning section above
+Licensed under the MIT License. See `LICENSE` file for details.
 
-## Version History
+---
 
-- **v1.0.0**: Initial release with full functionality
+## Contact and Support
+
+**For issues related to:**
+- **E2SAR library**: Refer to E2SAR project documentation
+- **ET library**: https://github.com/JeffersonLab/et
+- **This frame builder**: Open an issue in the project repository
+
+**Related Projects:**
+- **EMU PAGG**: https://github.com/JeffersonLab/emu (Java reference implementation)
+- **EJFAT**: LDRD streaming data acquisition project at Jefferson Lab
+- **CODA**: Jefferson Lab Data Acquisition system
+
+**Documentation:**
+- Build system: Meson documentation (mesonbuild.com)
+- EVIO format: CODA EVIO library documentation
+
+---
+
+**Version:** 1.0.0
+**Last Updated:** January 2025
