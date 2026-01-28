@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Example script for running E2SAR Standalone Receiver
+# Example script for running CODA Frame Builder
 #
 
 set -e
@@ -34,12 +34,12 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Look for executable in common locations
 RECEIVER_EXE=""
-if [[ -x "$PROJECT_DIR/builddir/e2sar_receiver" ]]; then
-    RECEIVER_EXE="$PROJECT_DIR/builddir/e2sar_receiver"
-elif command -v e2sar_receiver &> /dev/null; then
-    RECEIVER_EXE="e2sar_receiver"
+if [[ -x "$PROJECT_DIR/builddir/coda-fb" ]]; then
+    RECEIVER_EXE="$PROJECT_DIR/builddir/coda-fb"
+elif command -v coda-fb &> /dev/null; then
+    RECEIVER_EXE="coda-fb"
 else
-    echo "Error: e2sar_receiver executable not found"
+    echo "Error: coda-fb executable not found"
     echo "Please build the project first: cd $PROJECT_DIR && ./scripts/build.sh"
     exit 1
 fi

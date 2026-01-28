@@ -1,10 +1,10 @@
-project('e2sar_receiver', 'cpp',
+project('coda-fb', 'cpp',
         version: '1.0.0',
         default_options: ['cpp_std=c++17'],
         license: 'MIT')
 
 # Project information
-project_description = 'Standalone E2SAR Receiver - Receives UDP packets from EJFAT load balancer and persists frames to files'
+project_description = 'CODA Frame Builder - Aggregates real-time data frames from EJFAT load balancer for Jefferson Lab DAQ'
 
 # Set default installation directory based on CODA environment variable
 # Default: $CODA/Linux-x86_64/bin, fallback to ~/.local/bin if CODA not set
@@ -137,14 +137,14 @@ if compiler.compiles(thread_affinity_code, name: 'Thread Affinity check')
 endif
 
 # Add version information
-add_project_arguments('-DE2SAR_RECEIVER_VERSION="' + meson.project_version() + '"', 
+add_project_arguments('-DCODA_FB_VERSION="' + meson.project_version() + '"',
                      language: ['cpp'])
 
 # Warning level
 warning_level = 1
 
 # Source files
-receiver_sources = ['src/e2sar_receiver.cpp']
+receiver_sources = ['src/coda-fb.cpp']
 
 # Add frame builder if ET is available
 if et_dep.found()
@@ -186,7 +186,7 @@ endif
 
 if use_absolute_install
     # Use absolute path for CODA or ~/.local installation
-    executable('e2sar_receiver',
+    executable('coda-fb',
         receiver_sources,
         dependencies: receiver_deps,
         link_args: linker_flags,
@@ -194,7 +194,7 @@ if use_absolute_install
         install_dir: install_bin_dir)
 else
     # Use default meson behavior (prefix + bindir)
-    executable('e2sar_receiver',
+    executable('coda-fb',
         receiver_sources,
         dependencies: receiver_deps,
         link_args: linker_flags,
@@ -203,7 +203,7 @@ endif
 
 # Summary
 summary({
-    'E2SAR Receiver Version': meson.project_version(),
+    'CODA Frame Builder Version': meson.project_version(),
     'Build Type': get_option('buildtype'),
     'Install Directory': install_bin_dir,
     'C++ Standard': get_option('cpp_std'),

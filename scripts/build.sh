@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Build script for E2SAR Standalone Receiver
+# Build script for CODA Frame Builder
 #
 
 set -e
@@ -35,7 +35,7 @@ usage() {
     cat << EOF
 Usage: $0 [OPTIONS]
 
-Build E2SAR Standalone Receiver
+Build CODA Frame Builder
 
 OPTIONS:
     -h, --help          Show this help message
@@ -99,7 +99,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
 
-print_status "Building E2SAR Standalone Receiver"
+print_status "Building CODA Frame Builder"
 print_status "Build type: $BUILD_TYPE"
 print_status "Install: $INSTALL"
 if [[ "$INSTALL" == "true" ]]; then
@@ -159,14 +159,14 @@ meson compile -C builddir
 
 # Test executable
 print_status "Testing executable..."
-if [[ -x "builddir/e2sar_receiver" ]]; then
+if [[ -x "builddir/coda-fb" ]]; then
     print_status "Build successful!"
-    
+
     # Show help to verify it works
     echo
     print_status "Testing help output:"
     echo "----------------------------------------"
-    ./builddir/e2sar_receiver --help || true
+    ./builddir/coda-fb --help || true
     echo "----------------------------------------"
 else
     print_error "Build failed - executable not found"
@@ -179,7 +179,7 @@ if [[ "$INSTALL" == "true" ]]; then
 
     # Extract actual installation directory from meson introspection
     # This respects CODA or ~/.local/bin overrides
-    INSTALL_DIR=$(meson introspect builddir --installed | grep -o '"[^"]*e2sar_receiver"' | head -1 | sed 's/"//g')
+    INSTALL_DIR=$(meson introspect builddir --installed | grep -o '"[^"]*coda-fb"' | head -1 | sed 's/"//g')
 
     if [[ -z "$INSTALL_DIR" ]]; then
         # Fallback: try to determine from environment

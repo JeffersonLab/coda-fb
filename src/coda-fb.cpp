@@ -41,8 +41,8 @@ namespace bfs = boost::filesystem;
 using namespace e2sar;
 
 // Version information
-#ifndef E2SAR_RECEIVER_VERSION
-#define E2SAR_RECEIVER_VERSION "1.0.0"
+#ifndef CODA_FB_VERSION
+#define CODA_FB_VERSION "1.0.0"
 #endif
 
 // Global state for signal handling
@@ -891,7 +891,7 @@ int main(int argc, char **argv)
         po::store(po::parse_command_line(argc, argv, od), vm);
         
         if (vm.count("help")) {
-            std::cout << "E2SAR Standalone Receiver v" << E2SAR_RECEIVER_VERSION << std::endl;
+            std::cout << "CODA Frame Builder v" << CODA_FB_VERSION << std::endl;
             std::cout << "============================================" << std::endl;
             std::cout << od << std::endl;
             std::cout << "\n=== Example Usage ===" << std::endl;
@@ -1012,7 +1012,7 @@ int main(int argc, char **argv)
     // Set up signal handler
     signal(SIGINT, ctrlCHandler);
 
-    std::cout << "E2SAR Standalone Receiver v" << E2SAR_RECEIVER_VERSION << std::endl;
+    std::cout << "CODA Frame Builder v" << CODA_FB_VERSION << std::endl;
     std::cout << "Using E2SAR library v" << get_Version() << std::endl;
     std::cout << "=========================================" << std::endl;
 
