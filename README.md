@@ -917,4 +917,16 @@ Licensed under the MIT License. See `LICENSE` file for details.
 ---
 
 **Version:** 1.0.0
-**Last Updated:** January 2025
+**Last Updated:** Februry 2026
+
+## Current command used for testing
+```
+coda-fb  -u $EJFAT_URI --withcp -v --ip 129.57.109.231 --et-file /tmp/et_vgexpid_ERSA
+```
+
+Note: in all commandline use options to avoid certificate validation
+```
+--withcp -v
+```
+
+
