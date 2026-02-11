@@ -1049,10 +1049,16 @@ int main(int argc, char **argv)
         rflags.withLBHeader = !withCP;
         rflags.rcvSocketBufSize = sockBufSize;
         rflags.useHostAddress = preferV6;
-        rflags.validateCert = validate;
+        // Only set validateCert when actually using control plane (SSL/TLS context)
+        if (withCP) {
+            rflags.validateCert = validate;
+        }
         rflags.eventTimeout_ms = eventTimeoutMS;
 
         std::cout << "Control plane: " << (rflags.useCP ? "enabled" : "disabled") << std::endl;
+        if (withCP) {
+            std::cout << "SSL certificate validation: " << (validate ? "enabled" : "disabled") << std::endl;
+        }
         std::cout << "Event timeout: " << rflags.eventTimeout_ms << " ms" << std::endl;
         std::cout << "Socket buffer size: " << sockBufSize << " bytes" << std::endl;
         std::cout << "Output directory: " << outputDir << std::endl;
