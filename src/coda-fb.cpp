@@ -443,17 +443,17 @@ EVIOMetadata parseEVIOPayload(const u_int8_t* payload, size_t payloadSize) {
     // ========================================================================
     // STEP 5: Extract and Validate ROC_ID from Word 10 (Index 9)
     // ========================================================================
-    // Word 10 format: 0xXXXX_10_ss where:
-    //   - Upper 16 bits: varies by EVIO version (commonly 0x0010 or 0x0002)
-    //   - Next 8 bits must be 0x10 (fixed identifier)
-    //   - Lowest 8 bits (ss) = ROC/Stream identifier
+    // Word 10 format: ROC_ID (16 bits) + 0x10 + StreamStatus (8 bits)
+    //   - Upper 16 bits (bits 31-16): ROC_ID (readout controller identifier)
+    //   - Next 8 bits (bits 15-8) must be 0x10 (fixed identifier)
+    //   - Lowest 8 bits (bits 7-0) = StreamStatus flags
 
     uint32_t word10 = readWord(9);  // Word 10 in 1-based indexing
 
     // Extract the three components of word 10
-    [[maybe_unused]] uint16_t upper16 = (word10 >> 16) & 0xFFFF;  // Bits 31-16 (version-dependent)
+    uint16_t upper16 = (word10 >> 16) & 0xFFFF;  // Bits 31-16 (ROC_ID)
     uint8_t  next8   = (word10 >> 8)  & 0xFF;    // Bits 15-8 (must be 0x10)
-    uint8_t  ss      = word10 & 0xFF;             // Bits 7-0 (ROC ID)
+    uint8_t  ss      = word10 & 0xFF;             // Bits 7-0 (StreamStatus)
 
     // Validate only the middle byte (0x10) - upper 16 bits may vary by format version
     if (next8 != 0x10) {
@@ -462,8 +462,8 @@ EVIOMetadata parseEVIOPayload(const u_int8_t* payload, size_t payloadSize) {
         return meta;  // Return invalid metadata
     }
 
-    // Extract the ROC/Stream ID from the lowest 8 bits
-    meta.dataId = ss;
+    // Extract the ROC/Stream ID from the upper 16 bits
+    meta.dataId = upper16;
 
     // ========================================================================
     // STEP 6: Extract Frame Number from Word 14 (Index 13)
