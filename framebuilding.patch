@@ -1,0 +1,531 @@
+diff --git a/src/coda-fb.cpp b/src/coda-fb.cpp
+index e36a152..c7573a3 100644
+--- a/src/coda-fb.cpp
++++ b/src/coda-fb.cpp
+@@ -147,14 +147,12 @@ void performFinalCleanup()
+     // NOTE: We intentionally leak the frameBuilderPtr to avoid hanging
+     // in the destructor if Builder-0 thread is still running. The OS
+     // will clean up all resources when the process exits.
+-#ifdef ENABLE_FRAME_BUILDER
+     if (frameBuilderPtr != nullptr) {
+         frameBuilderPtr->printStatistics();
+         // DO NOT DELETE: Causes hang if thread was detached
+         // delete frameBuilderPtr;
+         frameBuilderPtr = nullptr;
+     }
+-#endif
+ 
+     // Close output file if open
+     if (globalOutputFd >= 0)
+@@ -193,6 +191,7 @@ void performFinalCleanup()
+         double avgBuildEventDataRateMBps = (totalElapsedSec > 0) ? (buildEventsBytesTotal.load() / totalElapsedSec / (1024.0 * 1024.0)) : 0.0;
+ 
+         std::cout << "\n======= Final Statistics =======" << std::endl;
++        std::cout << "Mode: " << (frameBuilderPtr != nullptr ? "Frame Building" : "Reassembly-Only") << std::endl;
+         std::cout << "--- Data Frames (Reassembled from UDP) ---" << std::endl;
+         std::cout << "\tData Frames: " << dataFramesReceived << std::endl;
+         std::cout << "\tData Volume: " << std::fixed << std::setprecision(2)
+@@ -201,12 +200,19 @@ void performFinalCleanup()
+                   << avgDataFrameRate << " frames/sec" << std::endl;
+         std::cout << "\tAvg Data Rate: " << std::fixed << std::setprecision(2)
+                   << avgDataFrameDataRateMBps << " MB/sec" << std::endl;
+-        std::cout << "--- Build Events (Aggregated/Written) ---" << std::endl;
+-        std::cout << "\tBuild Events: " << buildEventsWritten << std::endl;
++
++        if (frameBuilderPtr != nullptr) {
++            std::cout << "--- Build Events (Aggregated/Written) ---" << std::endl;
++        } else {
++            std::cout << "--- Output Frames (Written to File) ---" << std::endl;
++        }
++        std::cout << "\t" << (frameBuilderPtr != nullptr ? "Build Events" : "Frames Written")
++                  << ": " << buildEventsWritten << std::endl;
+         std::cout << "\tData Volume: " << std::fixed << std::setprecision(2)
+                   << (buildEventsBytesTotal.load() / (1024.0 * 1024.0)) << " MB" << std::endl;
+-        std::cout << "\tAvg Event Rate: " << std::fixed << std::setprecision(2)
+-                  << avgBuildEventRate << " events/sec" << std::endl;
++        std::cout << "\tAvg Rate: " << std::fixed << std::setprecision(2)
++                  << avgBuildEventRate << " "
++                  << (frameBuilderPtr != nullptr ? "events" : "frames") << "/sec" << std::endl;
+         std::cout << "\tAvg Data Rate: " << std::fixed << std::setprecision(2)
+                   << avgBuildEventDataRateMBps << " MB/sec" << std::endl;
+         std::cout << "--- Errors ---" << std::endl;
+@@ -627,57 +633,52 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
+         uint16_t rocId       = meta.dataId;        // ROC ID from payload word 10
+ 
+         // ====================================================================
+-        // STEP 5: Send Frame to Frame Builder for Aggregation
++        // STEP 5: Route Frame Based on Mode
+         // ====================================================================
+-        // The frame builder will:
+-        // 1. Validate and strip CODA block header from input frame
+-        // 2. Group frames with others by timestamp
+-        // 3. Build EVIO-6 aggregated time frame bank structure
+-        // 4. Output to ET system and/or files with 2GB rollover
+-        //
+-        // We pass the extracted metadata from the payload:
+-        // - timestamp: For grouping frames across multiple streams
+-        // - frameNumber: For tracking and debugging
+-        // - rocId: For identifying which ROC/stream this came from
+-        // - eventBuf: The actual payload data (includes CODA header to be stripped)
+-        // - eventSize: Size of payload in bytes
+-
+-#ifdef ENABLE_FRAME_BUILDER
+-        frameBuilder->addTimeSlice(
+-            timestamp,       // 64-bit timestamp for synchronization
+-            frameNumber,     // Frame sequence number
+-            rocId,           // ROC/Stream identifier
+-            eventBuf,        // Pointer to payload data (frame builder will strip CODA header)
+-            eventSize        // Size of payload
+-        );
+-
+-        // Note: buildEventsWritten is updated from frame builder statistics in statsReportingThread
+-#else
+-        // Without frame builder support, write raw frame directly to file
+-        // (This is a fallback mode without EVIO-6 formatting)
+-        if (outputFd >= 0) {
+-            // Acquire mutex to ensure thread-safe file writing
+-            std::lock_guard<std::mutex> lock(fileMutex);
+-
+-            // Write raw frame to file
+-            ssize_t bytesWritten = write(outputFd, eventBuf, eventSize);
+-
+-            if (bytesWritten < 0) {
+-                std::cerr << "Error writing event " << eventNum << " to file: "
+-                          << strerror(errno) << std::endl;
+-                writeErrors++;
+-            }
+-            else if (static_cast<size_t>(bytesWritten) != eventSize) {
+-                std::cerr << "Incomplete write for event " << eventNum
+-                          << ": wrote " << bytesWritten << " of " << eventSize
+-                          << " bytes" << std::endl;
+-                writeErrors++;
+-            } else {
+-                buildEventsWritten++;
+-                buildEventsBytesTotal += eventSize;
++        // Two modes:
++        // 1. Frame Building Mode (when frameBuilder != nullptr):
++        //    - Send to frame builder for aggregation
++        //    - Frame builder validates, groups by timestamp, builds EVIO-6 format
++        //    - Outputs to ET system and/or files with 2GB rollover
++        // 2. Reassembly-Only Mode (when frameBuilder == nullptr):
++        //    - Write raw reassembled frames directly to file
++        //    - No aggregation, no EVIO-6 formatting
++
++        if (frameBuilder != nullptr) {
++            // Frame building mode: send to aggregator
++            frameBuilder->addTimeSlice(
++                timestamp,       // 64-bit timestamp for synchronization
++                frameNumber,     // Frame sequence number
++                rocId,           // ROC/Stream identifier
++                eventBuf,        // Pointer to payload data (frame builder will strip CODA header)
++                eventSize        // Size of payload
++            );
++            // Note: buildEventsWritten is updated from frame builder statistics in statsReportingThread
++        } else {
++            // Reassembly-only mode: write raw frame directly to file
++            if (outputFd >= 0) {
++                // Acquire mutex to ensure thread-safe file writing
++                std::lock_guard<std::mutex> lock(fileMutex);
++
++                // Write raw frame to file
++                ssize_t bytesWritten = write(outputFd, eventBuf, eventSize);
++
++                if (bytesWritten < 0) {
++                    std::cerr << "Error writing event " << eventNum << " to file: "
++                              << strerror(errno) << std::endl;
++                    writeErrors++;
++                }
++                else if (static_cast<size_t>(bytesWritten) != eventSize) {
++                    std::cerr << "Incomplete write for event " << eventNum
++                              << ": wrote " << bytesWritten << " of " << eventSize
++                              << " bytes" << std::endl;
++                    writeErrors++;
++                } else {
++                    buildEventsWritten++;
++                    buildEventsBytesTotal += eventSize;
++                }
+             }
+         }
+-#endif
+ 
+         // ====================================================================
+         // STEP 6: Clean Up Frame Buffer
+@@ -702,12 +703,10 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
+         std::cout << "Reassembler threads stopped" << std::endl;
+     }
+ 
+-    // Now stop frame builder (no more data will arrive)
+-#ifdef ENABLE_FRAME_BUILDER
++    // Now stop frame builder if it was used (no more data will arrive)
+     if (frameBuilder != nullptr) {
+         frameBuilder->stop();
+     }
+-#endif
+ 
+     // Close output file if open
+     if (outputFd >= 0) {
+@@ -729,7 +728,6 @@ void statsReportingThread(Reassembler *r)
+         auto stats = r->getStats();
+ 
+         // Get frame builder statistics if available
+-#ifdef ENABLE_FRAME_BUILDER
+         if (frameBuilderPtr != nullptr) {
+             uint64_t fbBuilt, fbSlices, fbErrors, fbBytes;
+             frameBuilderPtr->getStatistics(fbBuilt, fbSlices, fbErrors, fbBytes);
+@@ -738,7 +736,6 @@ void statsReportingThread(Reassembler *r)
+             buildEventsWritten = fbBuilt;
+             buildEventsBytesTotal = fbBytes;
+         }
+-#endif
+ 
+         // Calculate elapsed time and rates
+         auto currentTime = boost::chrono::high_resolution_clock::now();
+@@ -754,6 +751,7 @@ void statsReportingThread(Reassembler *r)
+         double buildEventDataRateMBps = (elapsedSec > 0) ? (buildEventsBytesTotal.load() / elapsedSec / (1024.0 * 1024.0)) : 0.0;
+ 
+         std::cout << "\n=== Statistics Report ===" << std::endl;
++        std::cout << "Mode: " << (frameBuilderPtr != nullptr ? "Frame Building" : "Reassembly-Only") << std::endl;
+         std::cout << "--- Data Frames (Reassembled from UDP) ---" << std::endl;
+         std::cout << "  Data Frames: " << dataFramesReceived << std::endl;
+         std::cout << "  Data Volume: " << std::fixed << std::setprecision(2)
+@@ -762,12 +760,19 @@ void statsReportingThread(Reassembler *r)
+                   << dataFrameRate << " frames/sec" << std::endl;
+         std::cout << "  Data Rate: " << std::fixed << std::setprecision(2)
+                   << dataFrameDataRateMBps << " MB/sec" << std::endl;
+-        std::cout << "--- Build Events (Aggregated/Written) ---" << std::endl;
+-        std::cout << "  Build Events: " << buildEventsWritten << std::endl;
++
++        if (frameBuilderPtr != nullptr) {
++            std::cout << "--- Build Events (Aggregated/Written) ---" << std::endl;
++        } else {
++            std::cout << "--- Output Frames (Written to File) ---" << std::endl;
++        }
++        std::cout << "  " << (frameBuilderPtr != nullptr ? "Build Events" : "Frames Written")
++                  << ": " << buildEventsWritten << std::endl;
+         std::cout << "  Data Volume: " << std::fixed << std::setprecision(2)
+                   << (buildEventsBytesTotal.load() / (1024.0 * 1024.0)) << " MB" << std::endl;
+-        std::cout << "  Event Rate: " << std::fixed << std::setprecision(2)
+-                  << buildEventRate << " events/sec" << std::endl;
++        std::cout << "  Rate: " << std::fixed << std::setprecision(2)
++                  << buildEventRate << " "
++                  << (frameBuilderPtr != nullptr ? "events" : "frames") << "/sec" << std::endl;
+         std::cout << "  Data Rate: " << std::fixed << std::setprecision(2)
+                   << buildEventDataRateMBps << " MB/sec" << std::endl;
+         std::cout << "--- Errors ---" << std::endl;
+@@ -824,6 +829,7 @@ int main(int argc, char **argv)
+          "file extension for output file (default: '.bin')");
+ 
+     // Frame builder parameters
++    bool enableFramebuild;
+     std::string etFile;
+     std::string etHost;
+     int etPort;
+@@ -835,6 +841,10 @@ int main(int argc, char **argv)
+     int frameTimeout;
+     int expectedStreams;
+ 
++    // Framebuilding control option
++    opts("enable-framebuild", po::value<bool>(&enableFramebuild)->default_value(false),
++         "enable frame building/aggregation (default: false, reassembly-only mode)");
++
+     // ET output options
+     opts("et-file", po::value<std::string>(&etFile)->default_value(""),
+          "ET system file name (empty to disable ET output)");
+@@ -895,35 +905,38 @@ int main(int argc, char **argv)
+             std::cout << "============================================" << std::endl;
+             std::cout << od << std::endl;
+             std::cout << "\n=== Example Usage ===" << std::endl;
+-            std::cout << "\nNOTE: Frame builder is always used to aggregate frames and build EVIO-6 format." << std::endl;
+-            std::cout << "      At least one output method (ET or file) must be specified." << std::endl;
++            std::cout << "\nDEFAULT MODE: Reassembly-only (no frame building)" << std::endl;
++            std::cout << "Framebuilding is OPTIONAL and must be explicitly enabled with --enable-framebuild=1" << std::endl;
+ 
+-            std::cout << "\n1. File output with EVIO-6 aggregation (2GB auto-rollover):" << std::endl;
++            std::cout << "\n1. Default: Reassembly-only mode (raw frames to file):" << std::endl;
+             std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
+             std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
++            std::cout << "               --output-dir /data/raw \\" << std::endl;
++            std::cout << "               --prefix events --threads 4" << std::endl;
++
++            std::cout << "\n2. Enable framebuilding with file output (EVIO-6 aggregation, 2GB auto-rollover):" << std::endl;
++            std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
++            std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
++            std::cout << "               --enable-framebuild=1 \\" << std::endl;
+             std::cout << "               --fb-output-dir /data/frames \\" << std::endl;
+             std::cout << "               --fb-output-prefix aggregated \\" << std::endl;
+             std::cout << "               --fb-threads 4" << std::endl;
+ 
+-            std::cout << "\n2. ET output with EVIO-6 aggregation:" << std::endl;
++            std::cout << "\n3. Enable framebuilding with ET output:" << std::endl;
+             std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
+             std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
++            std::cout << "               --enable-framebuild=1 \\" << std::endl;
+             std::cout << "               --et-file /tmp/et_sys_pagg \\" << std::endl;
+             std::cout << "               --fb-threads 4" << std::endl;
+ 
+-            std::cout << "\n3. Dual output (ET + file backup):" << std::endl;
++            std::cout << "\n4. Enable framebuilding with dual output (ET + file backup):" << std::endl;
+             std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
+             std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
++            std::cout << "               --enable-framebuild=1 \\" << std::endl;
+             std::cout << "               --et-file /tmp/et_sys_pagg \\" << std::endl;
+             std::cout << "               --fb-output-dir /data/backup \\" << std::endl;
+             std::cout << "               --fb-output-prefix backup" << std::endl;
+ 
+-            std::cout << "\n4. Raw file output (fallback mode - only when frame builder unavailable):" << std::endl;
+-            std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
+-            std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
+-            std::cout << "               --output-dir /path/to/output \\" << std::endl;
+-            std::cout << "               --prefix events --extension .dat" << std::endl;
+-
+             return 0;
+         }
+         
+@@ -946,67 +959,94 @@ int main(int argc, char **argv)
+ 
+     validate = !vm["novalidate"].as<bool>();
+ 
+-    // Validate frame builder parameters (frame builder is always used)
++    // Validate based on framebuilding mode
+ #ifdef ENABLE_FRAME_BUILDER
+-    // Check that at least one output is enabled
+-    bool hasETOutput = !etFile.empty();
+-    bool hasFileOutput = !fbOutputDir.empty();
+-
+-    if (!hasETOutput && !hasFileOutput) {
+-        std::cerr << "Frame builder requires at least one output mode:" << std::endl;
+-        std::cerr << "  ET output: specify --et-file" << std::endl;
+-        std::cerr << "  File output: specify --fb-output-dir" << std::endl;
+-        return -1;
++    if (enableFramebuild) {
++        // Frame building mode - check that at least one output is enabled
++        bool hasETOutput = !etFile.empty();
++        bool hasFileOutput = !fbOutputDir.empty();
++
++        if (!hasETOutput && !hasFileOutput) {
++            std::cerr << "ERROR: Frame builder mode requires at least one output:" << std::endl;
++            std::cerr << "  ET output: specify --et-file" << std::endl;
++            std::cerr << "  File output: specify --fb-output-dir" << std::endl;
++            return -1;
++        }
++    } else {
++        // Reassembly-only mode - require direct file output
++        if (outputDir.empty()) {
++            std::cerr << "ERROR: Reassembly-only mode requires --output-dir" << std::endl;
++            std::cerr << "  (Or enable frame building with --enable-framebuild=1)" << std::endl;
++            return -1;
++        }
+     }
+ #else
+-    // Without frame builder, require direct file output
++    // Without frame builder compiled in, always require direct file output
+     if (outputDir.empty()) {
+         std::cerr << "Output directory (--output-dir) is required (frame builder not available)" << std::endl;
+         return -1;
+     }
++#endif
+ 
+-    // Validate output directory
+-    if (!bfs::exists(outputDir) || !bfs::is_directory(outputDir)) {
+-        std::cerr << "Output directory '" << outputDir << "' does not exist or is not a directory" << std::endl;
+-        return -1;
+-    }
++    // Validate output directory if needed (reassembly-only mode)
++#ifdef ENABLE_FRAME_BUILDER
++    if (!enableFramebuild && !outputDir.empty())
++#else
++    if (!outputDir.empty())
++#endif
++    {
++        // Validate output directory
++        if (!bfs::exists(outputDir) || !bfs::is_directory(outputDir)) {
++            std::cerr << "Output directory '" << outputDir << "' does not exist or is not a directory" << std::endl;
++            return -1;
++        }
+ 
+-    // Test write permissions
+-    struct stat dirStat;
+-    if (stat(outputDir.c_str(), &dirStat) != 0) {
+-        std::cerr << "Cannot access output directory: " << strerror(errno) << std::endl;
+-        return -1;
+-    }
++        // Test write permissions
++        struct stat dirStat;
++        if (stat(outputDir.c_str(), &dirStat) != 0) {
++            std::cerr << "Cannot access output directory: " << strerror(errno) << std::endl;
++            return -1;
++        }
+ 
+-    if (!(dirStat.st_mode & S_IWUSR)) {
+-        std::cerr << "No write permission for output directory" << std::endl;
+-        return -1;
+-    }
++        if (!(dirStat.st_mode & S_IWUSR)) {
++            std::cerr << "No write permission for output directory" << std::endl;
++            return -1;
++        }
+ 
+-    // Ensure extension starts with '.' if not empty
+-    if (!fileExtension.empty() && fileExtension[0] != '.') {
+-        fileExtension.insert(fileExtension.begin(), '.');
++        // Ensure extension starts with '.' if not empty
++        if (!fileExtension.empty() && fileExtension[0] != '.') {
++            fileExtension.insert(fileExtension.begin(), '.');
++        }
+     }
+-#endif
+ 
+ #ifdef ENABLE_FRAME_BUILDER
+-    // Validate thread count
+-    if (fbThreads < 1 || fbThreads > 32) {
+-        std::cerr << "Frame builder threads must be between 1 and 32" << std::endl;
+-        return -1;
+-    }
++    if (enableFramebuild) {
++        // Validate thread count
++        if (fbThreads < 1 || fbThreads > 32) {
++            std::cerr << "Frame builder threads must be between 1 and 32" << std::endl;
++            return -1;
++        }
+ 
+-    std::cout << "Frame builder enabled:" << std::endl;
+-    if (hasETOutput) {
+-        std::cout << "  ET output: " << etFile;
+-        if (!etHost.empty()) std::cout << " @ " << etHost;
+-        if (etPort > 0) std::cout << ":" << etPort;
+-        std::cout << " (GRAND_CENTRAL station)" << std::endl;
+-    }
+-    if (hasFileOutput) {
+-        std::cout << "  File output: " << fbOutputDir << "/" << fbOutputPrefix << "_*.evio" << std::endl;
++        bool hasETOutput = !etFile.empty();
++        bool hasFileOutput = !fbOutputDir.empty();
++
++        std::cout << "Frame builder: ENABLED" << std::endl;
++        if (hasETOutput) {
++            std::cout << "  ET output: " << etFile;
++            if (!etHost.empty()) std::cout << " @ " << etHost;
++            if (etPort > 0) std::cout << ":" << etPort;
++            std::cout << " (GRAND_CENTRAL station)" << std::endl;
++        }
++        if (hasFileOutput) {
++            std::cout << "  File output: " << fbOutputDir << "/" << fbOutputPrefix << "_*.evio" << std::endl;
++        }
++        std::cout << "  Builder Threads: " << fbThreads << std::endl;
++        std::cout << "  Expected Streams: " << expectedStreams << std::endl;
++    } else {
++        std::cout << "Frame builder: DISABLED (reassembly-only mode)" << std::endl;
+     }
+-    std::cout << "  Threads: " << fbThreads << std::endl;
++#else
++    std::cout << "Frame builder: NOT COMPILED (reassembly-only mode)" << std::endl;
+ #endif
+ 
+     // Set up signal handler
+@@ -1078,10 +1118,11 @@ int main(int argc, char **argv)
+             data_ip = boost::asio::ip::make_address(recvIP);
+         }
+ 
+-        // Create reassembler
++        // Create reassembler with multithreaded UDP reception
+         if (coreList.size() > 0) {
+             reasPtr = new Reassembler(uri, data_ip, recvStartPort, coreList, rflags);
+-            std::cout << "CPU cores: ";
++            std::cout << "Reassembly threads: " << coreList.size() << " (CPU-pinned)" << std::endl;
++            std::cout << "  CPU cores: ";
+             for (size_t i = 0; i < coreList.size(); ++i) {
+                 std::cout << coreList[i];
+                 if (i < coreList.size() - 1) std::cout << ", ";
+@@ -1089,11 +1130,11 @@ int main(int argc, char **argv)
+             std::cout << std::endl;
+         } else {
+             reasPtr = new Reassembler(uri, data_ip, recvStartPort, numThreads, rflags);
+-            std::cout << "Receiver threads: " << numThreads << std::endl;
++            std::cout << "Reassembly threads: " << numThreads << " (parallel UDP receivers)" << std::endl;
+         }
+ 
+         std::cout << "Listening on: " << data_ip << ":"
+-                  << recvStartPort << "-" << (recvStartPort + numThreads - 1) << std::endl;
++                  << recvStartPort << "-" << (recvStartPort + (coreList.size() > 0 ? coreList.size() : numThreads) - 1) << std::endl;
+ 
+         // Register and start receiving
+         auto prepareResult = prepareToReceive(*reasPtr);
+@@ -1105,35 +1146,53 @@ int main(int argc, char **argv)
+ 
+         std::cout << "Receiver started successfully. Press Ctrl+C to stop." << std::endl;
+ 
+-        // Initialize frame builder (always used when available)
++        // Initialize frame builder (only if enabled)
+ #ifdef ENABLE_FRAME_BUILDER
+-        std::cout << "\nInitializing frame builder..." << std::endl;
+-
+-        frameBuilderPtr = new e2sar::FrameBuilder(
+-            etFile,
+-            etHost,
+-            etPort,
+-            fbOutputDir,
+-            fbOutputPrefix,
+-            fbThreads,
+-            etEventSize,
+-            timestampSlop,
+-            frameTimeout,
+-            expectedStreams  // Number of expected data streams for aggregation
+-        );
+-
+-        if (!frameBuilderPtr->start()) {
+-            std::cerr << "Failed to start frame builder" << std::endl;
+-            delete frameBuilderPtr;
+-            frameBuilderPtr = nullptr;
+-            ctrlCHandler(0);
+-            return -1;
+-        }
++        if (enableFramebuild) {
++            std::cout << "\nInitializing frame builder..." << std::endl;
++
++            frameBuilderPtr = new e2sar::FrameBuilder(
++                etFile,
++                etHost,
++                etPort,
++                fbOutputDir,
++                fbOutputPrefix,
++                fbThreads,
++                etEventSize,
++                timestampSlop,
++                frameTimeout,
++                expectedStreams  // Number of expected data streams for aggregation
++            );
++
++            if (!frameBuilderPtr->start()) {
++                std::cerr << "Failed to start frame builder" << std::endl;
++                delete frameBuilderPtr;
++                frameBuilderPtr = nullptr;
++                ctrlCHandler(0);
++                return -1;
++            }
+ 
+-        std::cout << "Frame builder started successfully\n" << std::endl;
++            std::cout << "Frame builder started successfully\n" << std::endl;
++        } else {
++            // Reassembly-only mode - create direct output file
++            std::ostringstream outputFileName;
++            outputFileName << filePrefix << fileExtension;
++            bfs::path outputFilePath{outputDir};
++            outputFilePath /= outputFileName.str();
++
++            mode_t fileMode{S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH};
++            globalOutputFd = open(outputFilePath.c_str(), O_WRONLY|O_CREAT|O_TRUNC, fileMode);
++            if (globalOutputFd < 0)
++            {
++                std::cerr << "Unable to create output file " << outputFilePath << ": " << strerror(errno) << std::endl;
++                performFinalCleanup();
++                return -1;
++            }
++
++            std::cout << "Reassembly-only mode: Writing all frames to: " << outputFilePath << "\n" << std::endl;
++        }
+ #else
+-        // Without frame builder support, require direct file output
+-        // Create single output file
++        // Without frame builder compiled in, always use direct file output
+         std::ostringstream outputFileName;
+         outputFileName << filePrefix << fileExtension;
+         bfs::path outputFilePath{outputDir};
