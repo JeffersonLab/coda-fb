@@ -1,0 +1,638 @@
+/**
+ * EVIO6 Event Parser and Validator
+ *
+ * This program reads and validates EVIO6-format frame-built event files
+ * produced by coda-fb. It parses the hierarchical EVIO structure, validates
+ * against both the CODA Online Data Formats specification (coda_data_format.pdf)
+ * and the actual coda-fb writer implementation.
+ *
+ * Expected Structure (from coda-fb):
+ *  - File Header (14 words, EVIO6 format)
+ *  - Records (each with 14-word header + event data)
+ *    - Aggregated Frame Bank (tag 0xFF60, type 0x10)
+ *      - Stream Info Bank (tag 0xFF31, type 0x20)
+ *        - Time Slice Segment (tag 0x32, type 0x01)
+ *        - Aggregation Info Segment (tag 0x42, type 0x01)
+ *      - ROC Payload Banks (one per source)
+ *
+ * Copyright (c) 2024, Jefferson Science Associates
+ */
+
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cstdint>
+#include <cstring>
+#include <iomanip>
+#include <string>
+#include <sstream>
+#include <algorithm>
+
+// EVIO6 Constants
+namespace EVIO6 {
+    constexpr uint32_t FILE_ID_EVIO = 0x4556494F;  // "EVIO" in ASCII
+    constexpr uint32_t MAGIC_NUMBER = 0xC0DA0100;  // Big-endian magic
+    constexpr uint32_t MAGIC_NUMBER_LE = 0x0001DAC0;  // Little-endian magic
+    constexpr uint32_t HEADER_LENGTH = 14;  // words
+    constexpr uint8_t  VERSION = 6;
+
+    // CODA Tags (from coda-fb implementation)
+    constexpr uint16_t TAG_AGG_FRAME = 0xFF60;   // Aggregated frame bank
+    constexpr uint16_t TAG_STREAM_INFO = 0xFF31; // Stream Info Bank
+    constexpr uint8_t  TAG_TIME_SLICE = 0x32;    // Time Slice Segment
+    constexpr uint8_t  TAG_AGG_INFO = 0x42;      // Aggregation Info Segment
+    constexpr uint16_t TAG_ROC_BANK = 0xFF30;    // ROC Time Slice Bank
+
+    // EVIO Data Types
+    constexpr uint8_t TYPE_BANK = 0x10;
+    constexpr uint8_t TYPE_SEGMENT = 0x20;
+    constexpr uint8_t TYPE_INT = 0x01;
+}
+
+// Utility functions for byte swapping (big-endian <-> host)
+uint32_t ntoh32(uint32_t net) {
+    return ((net & 0x000000FF) << 24) |
+           ((net & 0x0000FF00) << 8) |
+           ((net & 0x00FF0000) >> 8) |
+           ((net & 0xFF000000) >> 24);
+}
+
+uint64_t ntoh64(uint64_t net) {
+    uint32_t high = ntoh32(static_cast<uint32_t>(net & 0xFFFFFFFF));
+    uint32_t low = ntoh32(static_cast<uint32_t>((net >> 32) & 0xFFFFFFFF));
+    return (static_cast<uint64_t>(high) << 32) | low;
+}
+
+// Validation result tracking
+struct ValidationResult {
+    bool success = true;
+    std::vector<std::string> errors;
+    std::vector<std::string> warnings;
+
+    void addError(const std::string& msg) {
+        errors.push_back(msg);
+        success = false;
+    }
+
+    void addWarning(const std::string& msg) {
+        warnings.push_back(msg);
+    }
+
+    void print() const {
+        std::cout << "\n=== Validation Summary ===\n";
+        std::cout << "Status: " << (success ? "SUCCESS" : "FAILED") << "\n";
+        std::cout << "Errors: " << errors.size() << "\n";
+        std::cout << "Warnings: " << warnings.size() << "\n";
+
+        if (!warnings.empty()) {
+            std::cout << "\nWarnings:\n";
+            for (const auto& w : warnings) {
+                std::cout << "  [WARN] " << w << "\n";
+            }
+        }
+
+        if (!errors.empty()) {
+            std::cout << "\nErrors:\n";
+            for (const auto& e : errors) {
+                std::cout << "  [ERROR] " << e << "\n";
+            }
+        }
+        std::cout << "==========================\n";
+    }
+};
+
+class EVIO6Parser {
+private:
+    std::vector<uint8_t> fileData;
+    size_t currentPos = 0;
+    ValidationResult result;
+    bool verbose = false;
+    int recordCount = 0;
+
+    // Read 32-bit word at current position (big-endian)
+    uint32_t read32() {
+        if (currentPos + 4 > fileData.size()) {
+            result.addError("Unexpected end of file at offset " +
+                          std::to_string(currentPos));
+            return 0;
+        }
+
+        uint32_t val = 0;
+        std::memcpy(&val, &fileData[currentPos], 4);
+        currentPos += 4;
+        return ntoh32(val);  // Convert from big-endian
+    }
+
+    // Peek at 32-bit word without advancing position
+    uint32_t peek32(size_t offset = 0) const {
+        if (currentPos + offset + 4 > fileData.size()) {
+            return 0;
+        }
+
+        uint32_t val = 0;
+        std::memcpy(&val, &fileData[currentPos + offset], 4);
+        return ntoh32(val);
+    }
+
+    // Read 64-bit word (big-endian)
+    uint64_t read64() {
+        uint32_t low = read32();
+        uint32_t high = read32();
+        return (static_cast<uint64_t>(high) << 32) | low;
+    }
+
+    void printIndent(int level) const {
+        for (int i = 0; i < level; i++) std::cout << "  ";
+    }
+
+    void printHeader(const std::string& title, int level = 0) const {
+        if (!verbose) return;
+        printIndent(level);
+        std::cout << "=== " << title << " ===\n";
+    }
+
+    void printField(const std::string& name, uint64_t value,
+                   const std::string& extra = "", int level = 0) const {
+        if (!verbose) return;
+        printIndent(level);
+        std::cout << name << ": " << value;
+        if (!extra.empty()) {
+            std::cout << " (" << extra << ")";
+        }
+        std::cout << "\n";
+    }
+
+    void printHex(const std::string& name, uint32_t value, int level = 0) const {
+        if (!verbose) return;
+        printIndent(level);
+        std::cout << name << ": 0x" << std::hex << std::setfill('0')
+                  << std::setw(8) << value << std::dec << "\n";
+    }
+
+public:
+    EVIO6Parser(bool verbose_mode = false) : verbose(verbose_mode) {}
+
+    bool loadFile(const std::string& filename) {
+        std::ifstream file(filename, std::ios::binary);
+        if (!file) {
+            std::cerr << "ERROR: Cannot open file: " << filename << std::endl;
+            return false;
+        }
+
+        file.seekg(0, std::ios::end);
+        size_t fileSize = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        fileData.resize(fileSize);
+        file.read(reinterpret_cast<char*>(fileData.data()), fileSize);
+
+        if (!file) {
+            std::cerr << "ERROR: Failed to read file: " << filename << std::endl;
+            return false;
+        }
+
+        std::cout << "Loaded file: " << filename << " (" << fileSize << " bytes)\n";
+        return true;
+    }
+
+    void parseFileHeader() {
+        printHeader("EVIO6 File Header", 0);
+
+        size_t startPos = currentPos;
+
+        // Word 1: File ID
+        uint32_t fileId = read32();
+        printHex("File ID", fileId, 1);
+
+        if (fileId != EVIO6::FILE_ID_EVIO) {
+            result.addError("Invalid file ID: expected 0x4556494F (EVIO), got 0x" +
+                          std::to_string(fileId));
+            return;
+        }
+
+        // Word 2: File Number
+        uint32_t fileNumber = read32();
+        printField("File Number", fileNumber, "", 1);
+
+        // Word 3: Header Length
+        uint32_t headerLength = read32();
+        printField("Header Length", headerLength, "words", 1);
+
+        if (headerLength != EVIO6::HEADER_LENGTH) {
+            result.addError("Invalid header length: expected 14, got " +
+                          std::to_string(headerLength));
+        }
+
+        // Word 4: Record Count
+        uint32_t recordCount = read32();
+        printField("Record Count", recordCount, "", 1);
+
+        // Word 5: Index Array Length
+        uint32_t indexArrayLength = read32();
+        printField("Index Array Length", indexArrayLength, "bytes", 1);
+
+        // Word 6: Bit Info + Version
+        uint32_t bitInfoVersion = read32();
+        uint8_t version = bitInfoVersion & 0xFF;
+        uint32_t bitInfo = (bitInfoVersion >> 8) & 0xFFFFFF;
+
+        printField("Version", version, "", 1);
+        printHex("Bit Info", bitInfo, 1);
+
+        if (version != EVIO6::VERSION) {
+            result.addError("Invalid EVIO version: expected 6, got " +
+                          std::to_string(version));
+        }
+
+        // Word 7: User Header Length
+        uint32_t userHeaderLength = read32();
+        printField("User Header Length", userHeaderLength, "bytes", 1);
+
+        // Word 8: Magic Number
+        uint32_t magic = read32();
+        printHex("Magic Number", magic, 1);
+
+        if (magic != EVIO6::MAGIC_NUMBER) {
+            result.addError("Invalid magic number: expected 0xC0DA0100, got 0x" +
+                          std::to_string(magic));
+        }
+
+        // Words 9-10: User Register
+        uint64_t userReg = read64();
+        printHex("User Register", static_cast<uint32_t>(userReg), 1);
+
+        // Words 11-12: Trailer Position
+        uint64_t trailerPos = read64();
+        printField("Trailer Position", trailerPos, "bytes", 1);
+
+        // Words 13-14: User Integers
+        uint32_t userInt1 = read32();
+        uint32_t userInt2 = read32();
+        printField("User Integer 1", userInt1, "", 1);
+        printField("User Integer 2", userInt2, "", 1);
+
+        size_t bytesRead = currentPos - startPos;
+        if (bytesRead != 56) {
+            result.addError("File header size mismatch: read " +
+                          std::to_string(bytesRead) + " bytes, expected 56");
+        }
+    }
+
+    void parseRecordHeader() {
+        printHeader("EVIO6 Record Header #" + std::to_string(recordCount), 0);
+        recordCount++;
+
+        size_t startPos = currentPos;
+
+        // Word 1: Record Length
+        uint32_t recordLength = read32();
+        printField("Record Length", recordLength, "words (inclusive)", 1);
+
+        if (recordLength == 0) {
+            result.addError("Invalid record length: 0");
+            return;
+        }
+
+        // Word 2: Record Number
+        uint32_t recordNumber = read32();
+        printField("Record Number", recordNumber, "", 1);
+
+        // Word 3: Header Length
+        uint32_t headerLength = read32();
+        printField("Header Length", headerLength, "words", 1);
+
+        if (headerLength != EVIO6::HEADER_LENGTH) {
+            result.addError("Invalid record header length: expected 14, got " +
+                          std::to_string(headerLength));
+        }
+
+        // Word 4: Event Index Count
+        uint32_t eventCount = read32();
+        printField("Event Index Count", eventCount, "", 1);
+
+        // Word 5: Index Array Length
+        uint32_t indexArrayLength = read32();
+        printField("Index Array Length", indexArrayLength, "bytes", 1);
+
+        // Word 6: Bit Info + Version
+        uint32_t bitInfoVersion = read32();
+        uint8_t version = bitInfoVersion & 0xFF;
+        uint32_t bitInfo = (bitInfoVersion >> 8) & 0xFFFFFF;
+        bool isLastRecord = (bitInfo & (1 << 9)) != 0;
+        bool hasBigEndian = (bitInfoVersion & 0x80000000) != 0;
+
+        printField("Version", version, "", 1);
+        printHex("Bit Info", bitInfo, 1);
+        printField("Is Last Record", isLastRecord, "", 1);
+        printField("Big Endian", hasBigEndian, "", 1);
+
+        if (version != EVIO6::VERSION) {
+            result.addError("Invalid record EVIO version: expected 6, got " +
+                          std::to_string(version));
+        }
+
+        // Word 7: User Header Length
+        uint32_t userHeaderLength = read32();
+        printField("User Header Length", userHeaderLength, "bytes", 1);
+
+        // Word 8: Magic Number
+        uint32_t magic = read32();
+        printHex("Magic Number", magic, 1);
+
+        if (magic != EVIO6::MAGIC_NUMBER) {
+            result.addError("Invalid magic number in record: expected 0xC0DA0100, got 0x" +
+                          std::to_string(magic));
+        }
+
+        // Word 9: Uncompressed Data Length
+        uint32_t uncompressedLen = read32();
+        printField("Uncompressed Data Length", uncompressedLen, "words", 1);
+
+        // Word 10: Compression Type + Compressed Length
+        uint32_t compressInfo = read32();
+        uint8_t compressType = (compressInfo >> 28) & 0xF;
+        uint32_t compressedLen = compressInfo & 0x0FFFFFFF;
+        printField("Compression Type", compressType, "", 1);
+        printField("Compressed Length", compressedLen, "words", 1);
+
+        // Words 11-14: User Registers (2 x 64-bit)
+        uint64_t userReg1 = read64();
+        uint64_t userReg2 = read64();
+        printHex("User Register 1", static_cast<uint32_t>(userReg1), 1);
+        printHex("User Register 2", static_cast<uint32_t>(userReg2), 1);
+
+        size_t bytesRead = currentPos - startPos;
+        if (bytesRead != 56) {
+            result.addError("Record header size mismatch: read " +
+                          std::to_string(bytesRead) + " bytes, expected 56");
+        }
+    }
+
+    void parseAggregatedFrameBank() {
+        printHeader("Aggregated Frame Bank", 1);
+
+        // Bank Length (exclusive)
+        uint32_t bankLength = read32();
+        printField("Bank Length", bankLength, "words (exclusive)", 2);
+
+        // Bank Header: tag (16) | type (8) | streamStatus (8)
+        uint32_t bankHeader = read32();
+        uint16_t tag = (bankHeader >> 16) & 0xFFFF;
+        uint8_t type = (bankHeader >> 8) & 0xFF;
+        uint8_t streamStatus = bankHeader & 0xFF;
+
+        printHex("Tag", tag, 2);
+        printField("Type", type, "0x10 = BANK", 2);
+        printField("Stream Status", streamStatus, "", 2);
+
+        if (tag != EVIO6::TAG_AGG_FRAME) {
+            result.addError("Invalid aggregated frame tag: expected 0xFF60, got 0x" +
+                          std::to_string(tag));
+        }
+
+        if (type != EVIO6::TYPE_BANK) {
+            result.addError("Invalid aggregated frame type: expected 0x10 (BANK), got 0x" +
+                          std::to_string(type));
+        }
+    }
+
+    void parseStreamInfoBank() {
+        printHeader("Stream Info Bank", 2);
+
+        // Bank Length
+        uint32_t bankLength = read32();
+        printField("Bank Length", bankLength, "words (exclusive)", 3);
+
+        // Bank Header: tag (16) | type (8) | streamStatus (8)
+        uint32_t bankHeader = read32();
+        uint16_t tag = (bankHeader >> 16) & 0xFFFF;
+        uint8_t type = (bankHeader >> 8) & 0xFF;
+        uint8_t streamStatus = bankHeader & 0xFF;
+
+        printHex("Tag", tag, 3);
+        printField("Type", type, "0x20 = SEGMENT", 3);
+        printField("Stream Status", streamStatus, "", 3);
+
+        if (tag != EVIO6::TAG_STREAM_INFO) {
+            result.addError("Invalid stream info tag: expected 0xFF31, got 0x" +
+                          std::to_string(tag));
+        }
+
+        if (type != EVIO6::TYPE_SEGMENT) {
+            result.addError("Invalid stream info type: expected 0x20 (SEGMENT), got 0x" +
+                          std::to_string(type));
+        }
+    }
+
+    void parseTimeSliceSegment() {
+        printHeader("Time Slice Segment (TSS)", 3);
+
+        // Segment Header: tag (8) | type (8) | length (16)
+        uint32_t segHeader = read32();
+        uint8_t tag = (segHeader >> 24) & 0xFF;
+        uint8_t type = (segHeader >> 16) & 0xFF;
+        uint16_t length = segHeader & 0xFFFF;
+
+        printHex("Tag", tag, 4);
+        printField("Type", type, "0x01 = INT", 4);
+        printField("Length", length, "words", 4);
+
+        if (tag != EVIO6::TAG_TIME_SLICE) {
+            result.addError("Invalid time slice segment tag: expected 0x32, got 0x" +
+                          std::to_string((int)tag));
+        }
+
+        if (type != EVIO6::TYPE_INT) {
+            result.addError("Invalid time slice segment type: expected 0x01 (INT), got 0x" +
+                          std::to_string((int)type));
+        }
+
+        if (length != 3) {
+            result.addWarning("Time slice segment length is " + std::to_string(length) +
+                            " words, expected 3");
+        }
+
+        // TSS Data: frameNumber, timestamp_low, timestamp_high
+        uint32_t frameNumber = read32();
+        uint32_t tsLow = read32();
+        uint32_t tsHigh = read32();
+        uint64_t timestamp = (static_cast<uint64_t>(tsHigh) << 32) | tsLow;
+
+        printField("Frame Number", frameNumber, "", 4);
+        printField("Timestamp", timestamp, "", 4);
+    }
+
+    void parseAggregationInfoSegment() {
+        printHeader("Aggregation Info Segment (AIS)", 3);
+
+        // Segment Header: tag (8) | type (8) | length (16)
+        uint32_t segHeader = read32();
+        uint8_t tag = (segHeader >> 24) & 0xFF;
+        uint8_t type = (segHeader >> 16) & 0xFF;
+        uint16_t length = segHeader & 0xFFFF;
+
+        printHex("Tag", tag, 4);
+        printField("Type", type, "0x01 = INT", 4);
+        printField("Length", length, "ROC count", 4);
+
+        if (tag != EVIO6::TAG_AGG_INFO) {
+            result.addError("Invalid aggregation info segment tag: expected 0x42, got 0x" +
+                          std::to_string((int)tag));
+        }
+
+        if (type != EVIO6::TYPE_INT) {
+            result.addError("Invalid aggregation info segment type: expected 0x01 (INT), got 0x" +
+                          std::to_string((int)type));
+        }
+
+        // AIS Data: ROC IDs
+        for (int i = 0; i < length; i++) {
+            uint32_t rocEntry = read32();
+            uint16_t rocId = (rocEntry >> 16) & 0xFFFF;
+            uint8_t reserved = (rocEntry >> 8) & 0xFF;
+            uint8_t status = rocEntry & 0xFF;
+
+            if (verbose) {
+                printIndent(4);
+                std::cout << "ROC " << i << ": ID=0x" << std::hex << rocId
+                         << ", Status=0x" << (int)status << std::dec << "\n";
+            }
+        }
+    }
+
+    void parseROCPayloadBank(int rocIndex) {
+        printHeader("ROC Payload Bank #" + std::to_string(rocIndex), 2);
+
+        // ROC Bank Length
+        uint32_t bankLength = read32();
+        printField("ROC Bank Length", bankLength, "words (exclusive)", 3);
+
+        // ROC Bank Header
+        uint32_t bankHeader = read32();
+        uint16_t tag = (bankHeader >> 16) & 0xFFFF;
+        uint8_t type = (bankHeader >> 8) & 0xFF;
+        uint8_t streamStatus = bankHeader & 0xFF;
+
+        printHex("Tag", tag, 3);
+        printField("Type", type, "", 3);
+        printField("Stream Status", streamStatus, "", 3);
+
+        // Skip payload data (bankLength - 1 for header word we already read)
+        if (bankLength > 1) {
+            size_t payloadWords = bankLength - 1;
+            size_t payloadBytes = payloadWords * 4;
+
+            if (currentPos + payloadBytes > fileData.size()) {
+                result.addError("ROC payload extends beyond file boundary");
+                return;
+            }
+
+            printField("Payload Size", payloadBytes, "bytes", 3);
+            currentPos += payloadBytes;
+        }
+    }
+
+    void parseEvent() {
+        // Parse aggregated frame structure
+        parseAggregatedFrameBank();
+        parseStreamInfoBank();
+        parseTimeSliceSegment();
+
+        // Parse aggregation info to know how many ROC banks to expect
+        size_t aisPos = currentPos;
+        uint32_t aisHeader = peek32();
+        uint8_t tag = (aisHeader >> 24) & 0xFF;
+        uint16_t rocCount = aisHeader & 0xFFFF;
+
+        parseAggregationInfoSegment();
+
+        // Parse ROC payload banks
+        for (int i = 0; i < rocCount && currentPos < fileData.size(); i++) {
+            parseROCPayloadBank(i);
+        }
+    }
+
+    void parse() {
+        currentPos = 0;
+        recordCount = 0;
+
+        std::cout << "\n=== Starting EVIO6 File Parsing ===\n\n";
+
+        // Parse file header
+        parseFileHeader();
+
+        if (!result.success) {
+            std::cout << "\nFile header validation failed. Stopping.\n";
+            return;
+        }
+
+        // Parse records until end of file
+        int maxRecords = 100;  // Safety limit for testing
+        while (currentPos < fileData.size() && recordCount < maxRecords) {
+            size_t recordStart = currentPos;
+
+            // Parse record header
+            parseRecordHeader();
+
+            if (!result.success && result.errors.size() > 10) {
+                std::cout << "\nToo many errors. Stopping.\n";
+                break;
+            }
+
+            // Parse event data
+            if (currentPos < fileData.size()) {
+                parseEvent();
+            }
+
+            // Check if we've processed entire record
+            size_t recordSize = currentPos - recordStart;
+            if (verbose) {
+                std::cout << "\nRecord size: " << recordSize << " bytes\n";
+            }
+        }
+
+        std::cout << "\n=== Parsing Complete ===\n";
+        std::cout << "Total records processed: " << recordCount << "\n";
+        std::cout << "File position: " << currentPos << " / " << fileData.size()
+                  << " bytes\n";
+
+        if (currentPos < fileData.size()) {
+            std::cout << "Remaining data: " << (fileData.size() - currentPos)
+                      << " bytes\n";
+        }
+    }
+
+    const ValidationResult& getResult() const {
+        return result;
+    }
+};
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <evio_file> [--verbose]\n";
+        std::cerr << "\nThis program parses and validates EVIO6-format frame-built\n";
+        std::cerr << "event files produced by coda-fb.\n";
+        return 1;
+    }
+
+    std::string filename = argv[1];
+    bool verbose = (argc > 2 && std::string(argv[2]) == "--verbose");
+
+    std::cout << "EVIO6 Event Parser and Validator\n";
+    std::cout << "=================================\n";
+    std::cout << "File: " << filename << "\n";
+    std::cout << "Verbose: " << (verbose ? "enabled" : "disabled") << "\n\n";
+
+    EVIO6Parser parser(verbose);
+
+    if (!parser.loadFile(filename)) {
+        return 1;
+    }
+
+    parser.parse();
+
+    const auto& result = parser.getResult();
+    result.print();
+
+    return result.success ? 0 : 1;
+}
