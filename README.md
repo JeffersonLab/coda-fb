@@ -61,6 +61,11 @@ coda-fb --uri 'ejfat://...' --ip 192.168.1.100 --port 10000 \
   --fb-threads 8 --threads 4
 ```
 
+**Current test run CL for 3 ROC configuration:**
+```bash
+./coda-fb -u "$EJFAT_URI" -v --withcp --ip 129.57.109.231 --threads 4 --enable-framebuild=1 --expected-streams=3 --fb-threads 1 --fb-output-dir $CODA_DATA
+```
+
 **Key options:**
 - `--uri`: EJFAT control plane URI (required)
 - `--ip`, `--port`: Local IP and starting port
