@@ -201,6 +201,20 @@ else
         install: true)
 endif
 
+# Build EVIO Event Parser (standalone utility, no external dependencies)
+parser_sources = ['src/parser/evio_event_parser.cpp']
+
+if use_absolute_install
+    executable('evio_event_parser',
+        parser_sources,
+        install: true,
+        install_dir: install_bin_dir)
+else
+    executable('evio_event_parser',
+        parser_sources,
+        install: true)
+endif
+
 # Summary
 summary({
     'CODA Frame Builder Version': meson.project_version(),
@@ -219,3 +233,8 @@ summary({
     'Protobuf': protobuf_lib.found() ? 'Found (/usr/local)' : 'Not Found',
     'ET Library': et_dep.found() ? 'Found (frame builder enabled)' : 'Not Found (frame builder disabled)',
 }, section: 'Dependencies')
+
+summary({
+    'coda-fb': 'CODA Frame Builder (main executable)',
+    'evio_event_parser': 'EVIO6 event structure validator and parser',
+}, section: 'Build Targets')

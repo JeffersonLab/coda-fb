@@ -157,21 +157,37 @@ fi
 print_status "Building..."
 meson compile -C builddir
 
-# Test executable
-print_status "Testing executable..."
-if [[ -x "builddir/coda-fb" ]]; then
-    print_status "Build successful!"
+# Test executables
+print_status "Testing executables..."
 
-    # Show help to verify it works
-    echo
-    print_status "Testing help output:"
-    echo "----------------------------------------"
-    ./builddir/coda-fb --help || true
-    echo "----------------------------------------"
-else
-    print_error "Build failed - executable not found"
+# Check coda-fb
+if [[ ! -x "builddir/coda-fb" ]]; then
+    print_error "Build failed - coda-fb executable not found"
     exit 1
 fi
+
+# Check evio_event_parser
+if [[ ! -x "builddir/evio_event_parser" ]]; then
+    print_error "Build failed - evio_event_parser executable not found"
+    exit 1
+fi
+
+print_status "Build successful! Both executables found:"
+print_status "  - coda-fb"
+print_status "  - evio_event_parser"
+
+# Show help to verify they work
+echo
+print_status "Testing coda-fb help output:"
+echo "----------------------------------------"
+./builddir/coda-fb --help || true
+echo "----------------------------------------"
+
+echo
+print_status "Testing evio_event_parser help output:"
+echo "----------------------------------------"
+./builddir/evio_event_parser --help || true
+echo "----------------------------------------"
 
 # Install if requested
 if [[ "$INSTALL" == "true" ]]; then
