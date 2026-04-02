@@ -63,6 +63,20 @@ uint64_t ntoh64(uint64_t net) {
     return (static_cast<uint64_t>(high) << 32) | low;
 }
 
+// FADC250 Hit data structure
+struct FADCHit {
+    int crate;        // ROC ID
+    int slot;         // Payload ID (slot number)
+    int channel;      // Channel number (0-15)
+    int charge;       // Integrated charge (13 bits)
+    uint64_t time;    // Absolute hit time in nanoseconds
+
+    FADCHit(int c, int s, int ch, int q, uint64_t t)
+        : crate(c), slot(s), channel(ch), charge(q), time(t) {}
+
+    FADCHit() : crate(0), slot(0), channel(0), charge(0), time(0) {}
+};
+
 // Validation result tracking
 struct ValidationResult {
     bool success = true;
@@ -107,7 +121,11 @@ private:
     size_t currentPos = 0;
     ValidationResult result;
     bool verbose = false;
+    bool fadcVerbose = false;
     int recordCount = 0;
+    uint64_t currentFrameTimestamp = 0;
+    std::vector<FADCHit> currentEventHits;
+    std::vector<int> currentEventROCIds;
 
     // Read 32-bit word at current position (big-endian)
     uint32_t read32() {
@@ -169,8 +187,56 @@ private:
                   << std::setw(8) << value << std::dec << "\n";
     }
 
+    std::vector<FADCHit> decodeFADC250Payload(
+        uint64_t frameTimestampNs,
+        int rocId,
+        int slotId,
+        const uint8_t* payloadData,
+        size_t payloadBytes
+    ) {
+        std::vector<FADCHit> hits;
+
+        // Validate payload size is multiple of 4
+        if (payloadBytes % 4 != 0) {
+            result.addWarning("FADC250 payload size (" + std::to_string(payloadBytes) +
+                            " bytes) not multiple of 4");
+            payloadBytes = (payloadBytes / 4) * 4;  // Truncate
+        }
+
+        size_t numWords = payloadBytes / 4;
+
+        for (size_t i = 0; i < numWords; i++) {
+            // Read 32-bit word in BIG_ENDIAN
+            uint32_t word = 0;
+            std::memcpy(&word, payloadData + (i * 4), 4);
+            word = ntoh32(word);
+
+            // Extract fields
+            int charge = word & 0x1FFF;                        // Bits 0-12
+            int channel = (word >> 13) & 0x000F;               // Bits 13-16
+            uint64_t timeOffset = ((word >> 17) & 0x3FFF) * 4; // Bits 17-30, * 4ns
+
+            uint64_t hitTime = frameTimestampNs + timeOffset;
+
+            // Validation
+            if (channel > 15) {
+                result.addWarning("Invalid FADC250 channel: " + std::to_string(channel) +
+                                " in ROC " + std::to_string(rocId));
+            }
+
+            hits.emplace_back(rocId, slotId, channel, charge, hitTime);
+        }
+
+        // Sort by time
+        std::sort(hits.begin(), hits.end(),
+                 [](const FADCHit& a, const FADCHit& b) { return a.time < b.time; });
+
+        return hits;
+    }
+
 public:
-    EVIO6Parser(bool verbose_mode = false) : verbose(verbose_mode) {}
+    EVIO6Parser(bool verbose_mode = false, bool fadc_verbose_mode = false)
+        : verbose(verbose_mode), fadcVerbose(fadc_verbose_mode) {}
 
     bool loadFile(const std::string& filename) {
         std::ifstream file(filename, std::ios::binary);
@@ -460,6 +526,8 @@ public:
 
         printField("Frame Number", frameNumber, "", 4);
         printField("Timestamp", timestamp, "", 4);
+
+        currentFrameTimestamp = timestamp;  // Store for FADC decoding
     }
 
     void parseAggregationInfoSegment() {
@@ -517,7 +585,7 @@ public:
         printField("Type", type, "", 3);
         printField("Stream Status", streamStatus, "", 3);
 
-        // Skip payload data (bankLength - 1 for header word we already read)
+        // Decode payload data (bankLength - 1 for header word we already read)
         if (bankLength > 1) {
             size_t payloadWords = bankLength - 1;
             size_t payloadBytes = payloadWords * 4;
@@ -528,27 +596,75 @@ public:
             }
 
             printField("Payload Size", payloadBytes, "bytes", 3);
+
+            // Get ROC ID from stored list (use index if not available)
+            int rocId = (rocIndex < currentEventROCIds.size()) ? currentEventROCIds[rocIndex] : rocIndex;
+
+            // Decode FADC250 payload
+            const uint8_t* payloadData = &fileData[currentPos];
+            std::vector<FADCHit> hits = decodeFADC250Payload(
+                currentFrameTimestamp,
+                rocId,
+                tag,  // Slot number from payload bank header tag
+                payloadData,
+                payloadBytes
+            );
+
+            // Print hits if FADC verbose enabled
+            if (fadcVerbose && !hits.empty()) {
+                printHeader("FADC250 Hits (" + std::to_string(hits.size()) + " hits)", 3);
+                for (const auto& hit : hits) {
+                    printIndent(4);
+                    std::cout << "Crate=" << hit.crate
+                             << " Slot=" << hit.slot
+                             << " Chan=" << hit.channel
+                             << " Charge=" << hit.charge
+                             << " Time=" << hit.time << "ns\n";
+                }
+            }
+
+            // Accumulate for event summary
+            currentEventHits.insert(currentEventHits.end(), hits.begin(), hits.end());
+
             currentPos += payloadBytes;
         }
     }
 
     void parseEvent() {
+        // Clear state from previous event
+        currentEventHits.clear();
+        currentEventROCIds.clear();
+
         // Parse aggregated frame structure
         parseAggregatedFrameBank();
         parseStreamInfoBank();
-        parseTimeSliceSegment();
+        parseTimeSliceSegment();  // Now stores currentFrameTimestamp
 
-        // Parse aggregation info to know how many ROC banks to expect
-        size_t aisPos = currentPos;
-        uint32_t aisHeader = peek32();
-        uint8_t tag = (aisHeader >> 24) & 0xFF;
+        // Extract ROC IDs from aggregation info segment before parsing it
+        size_t savedPos = currentPos;
+        uint32_t aisHeader = read32();
         uint16_t rocCount = aisHeader & 0xFFFF;
 
+        // Read and store ROC IDs
+        for (int i = 0; i < rocCount; i++) {
+            uint32_t rocEntry = read32();
+            uint16_t rocId = (rocEntry >> 16) & 0xFFFF;
+            currentEventROCIds.push_back(rocId);
+        }
+
+        // Restore position and parse segment normally
+        currentPos = savedPos;
         parseAggregationInfoSegment();
 
         // Parse ROC payload banks
         for (int i = 0; i < rocCount && currentPos < fileData.size(); i++) {
             parseROCPayloadBank(i);
+        }
+
+        // Print event summary
+        if (fadcVerbose && !currentEventHits.empty()) {
+            printHeader("Event FADC Summary: " + std::to_string(currentEventHits.size()) +
+                       " total hits", 1);
         }
     }
 
@@ -609,21 +725,36 @@ public:
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <evio_file> [--verbose]\n";
+        std::cerr << "Usage: " << argv[0] << " <evio_file> [--verbose] [--fadc-verbose]\n";
         std::cerr << "\nThis program parses and validates EVIO6-format frame-built\n";
         std::cerr << "event files produced by coda-fb.\n";
+        std::cerr << "\nOptions:\n";
+        std::cerr << "  --verbose       Show detailed EVIO structure\n";
+        std::cerr << "  --fadc-verbose  Show decoded FADC250 hits\n";
         return 1;
     }
 
     std::string filename = argv[1];
-    bool verbose = (argc > 2 && std::string(argv[2]) == "--verbose");
+    bool verbose = false;
+    bool fadcVerbose = false;
+
+    // Parse flags
+    for (int i = 2; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--verbose") {
+            verbose = true;
+        } else if (arg == "--fadc-verbose") {
+            fadcVerbose = true;
+        }
+    }
 
     std::cout << "EVIO6 Event Parser and Validator\n";
     std::cout << "=================================\n";
     std::cout << "File: " << filename << "\n";
-    std::cout << "Verbose: " << (verbose ? "enabled" : "disabled") << "\n\n";
+    std::cout << "Verbose: " << (verbose ? "enabled" : "disabled") << "\n";
+    std::cout << "FADC Verbose: " << (fadcVerbose ? "enabled" : "disabled") << "\n\n";
 
-    EVIO6Parser parser(verbose);
+    EVIO6Parser parser(verbose, fadcVerbose);
 
     if (!parser.loadFile(filename)) {
         return 1;
