@@ -406,7 +406,7 @@ public:
         std::vector<uint32_t> eventWords;
 
         eventWords.push_back(0);  // Word 0: recordLength (filled later)
-        eventWords.push_back(0);  // Word 1: recordNumber
+        eventWords.push_back(framesBuilt + 1);  // Word 1: recordNumber (1-indexed count of successfully built frames)
         eventWords.push_back(14); // Word 2: headerLength (always 14 for EVIO-6)
         eventWords.push_back(1);  // Word 3: eventIndexCount (1 event per record)
         eventWords.push_back(0);  // Word 4: indexArrayLength (0 = no index)
@@ -507,9 +507,9 @@ public:
         size_t recordLength = 14 + aggregatedBankLength + 1;  // +1 for aggregatedBankLength field itself
         eventWords[0] = static_cast<uint32_t>(recordLength);
 
-        // uncompressedDataLength = words after record header
+        // uncompressedDataLength = bytes after record header (EVIO6 spec: word 8 must be in bytes)
         size_t uncompressedDataLength = recordLength - 14;
-        eventWords[8] = static_cast<uint32_t>(uncompressedDataLength);
+        eventWords[8] = static_cast<uint32_t>(uncompressedDataLength * 4);  // Convert words to bytes
 
         // ========================================================================
         // STEP 7: Byte Swap to BIG Endian and Write Header/Metadata
