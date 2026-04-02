@@ -52,6 +52,7 @@ e2sar::FrameBuilder *frameBuilderPtr{nullptr};  // Global frame builder pointer 
 std::atomic<bool> handlerTriggered{false};
 int globalOutputFd{-1};  // Global file descriptor for single output file
 std::mutex fileMutex;    // Mutex to protect file writes
+bool verboseFrameInfo = false;  // Global flag for verbose frame number logging
 
 // Note: Frame builder is always used when ENABLE_FRAME_BUILDER is defined
 
@@ -633,6 +634,17 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
         uint16_t rocId       = meta.dataId;        // ROC ID from payload word 10
 
         // ====================================================================
+        // VERBOSE LOGGING: Print frame information if requested
+        // ====================================================================
+        if (verboseFrameInfo) {
+            std::cout << "[FRAME] FrameNum=" << std::setw(8) << frameNumber
+                      << " | Timestamp=" << std::setw(16) << timestamp
+                      << " | ROC_ID=" << std::setw(4) << rocId
+                      << " | Size=" << std::setw(8) << eventSize << " bytes"
+                      << std::endl;
+        }
+
+        // ====================================================================
         // STEP 5: Route Frame Based on Mode
         // ====================================================================
         // Two modes:
@@ -877,6 +889,9 @@ int main(int argc, char **argv)
     opts("expected-streams", po::value<int>(&expectedStreams)->default_value(1),
          "number of expected data streams per frame number - frame builds immediately when all "
          "streams arrive, or after timeout if incomplete (default: 1)");
+    opts("verbose-frames", po::value<bool>(&verboseFrameInfo)->default_value(false),
+         "print detailed frame information for every received frame: frame number, timestamp, "
+         "ROC ID, and payload size - useful for debugging stream synchronization (default: false)");
 
     // Performance parameters
     opts("threads,t", po::value<size_t>(&numThreads)->default_value(1), 
