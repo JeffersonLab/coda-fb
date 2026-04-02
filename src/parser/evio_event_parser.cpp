@@ -412,7 +412,7 @@ public:
 
         // Word 9: Uncompressed Data Length
         uint32_t uncompressedLen = read32();
-        printField("Uncompressed Data Length", uncompressedLen, "words", 1);
+        printField("Uncompressed Data Length", uncompressedLen, "bytes", 1);
 
         // Word 10: Compression Type + Compressed Length
         uint32_t compressInfo = read32();
