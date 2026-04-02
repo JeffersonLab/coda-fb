@@ -84,8 +84,8 @@ struct AggregatedFrame {
         arrivalTime = std::chrono::steady_clock::now();
     }
 
-    void addSlice(const TimeSlice& slice) {
-        slices.push_back(slice);
+    void addSlice(TimeSlice&& slice) {
+        slices.push_back(std::move(slice));
     }
 
     size_t getSliceCount() const {
@@ -324,7 +324,7 @@ public:
     /**
      * Add a time slice to this builder's buffer
      */
-    void addTimeSlice(const TimeSlice& slice) {
+    void addTimeSlice(TimeSlice&& slice) {
         std::lock_guard<std::mutex> lock(frameMutex);
 
         // Find or create aggregated frame
@@ -336,7 +336,7 @@ public:
             frame.arrivalTime = std::chrono::steady_clock::now();
         }
 
-        frame.addSlice(slice);
+        frame.addSlice(std::move(slice));
         slicesProcessed++;
 
         // Signal builder thread
@@ -364,8 +364,13 @@ public:
         // Build stream status: bit 7 = error flag, bits 0-6 = slice count
         int streamStatus = ((hasError ? 1 : 0) << 7) | (sliceCount & 0x7F);
 
-        // Collect stripped ROC banks (without CODA headers)
-        std::vector<std::vector<uint8_t>> rocBanks;
+        // Validate slices and calculate total ROC data size (first pass)
+        struct ValidatedSlice {
+            const uint8_t* rocData;  // Points to payload + 32 bytes
+            size_t rocSize;          // Size of ROC data (payload size - 32)
+        };
+        std::vector<ValidatedSlice> validatedSlices;
+        validatedSlices.reserve(frame.slices.size());
 
         for (const auto& slice : frame.slices) {
             // Verify minimum size (8 words = 32 bytes)
@@ -390,12 +395,14 @@ public:
                 continue;
             }
 
-            // Strip first 8 words (32 bytes) to get ROC bank
-            std::vector<uint8_t> rocBank(slice.payload.begin() + 32, slice.payload.end());
-            rocBanks.push_back(std::move(rocBank));
+            // Record validated slice (ROC data starts at byte 32)
+            ValidatedSlice vs;
+            vs.rocData = slice.payload.data() + 32;
+            vs.rocSize = slice.payload.size() - 32;
+            validatedSlices.push_back(vs);
         }
 
-        if (rocBanks.empty()) {
+        if (validatedSlices.empty()) {
             std::cerr << "[" << threadName << "] ERROR: No valid ROC banks after CODA header validation" << std::endl;
             return false;
         }
@@ -485,11 +492,11 @@ public:
         // ========================================================================
 
         size_t totalPayloadBytes = 0;
-        for (const auto& rocBank : rocBanks) {
-            totalPayloadBytes += rocBank.size();
+        for (const auto& vs : validatedSlices) {
+            totalPayloadBytes += vs.rocSize;
             // Account for padding to 4-byte boundary
-            if (rocBank.size() % 4 != 0) {
-                totalPayloadBytes += 4 - (rocBank.size() % 4);
+            if (vs.rocSize % 4 != 0) {
+                totalPayloadBytes += 4 - (vs.rocSize % 4);
             }
         }
 
@@ -515,6 +522,9 @@ public:
         // STEP 7: Byte Swap to BIG Endian and Write Header/Metadata
         // ========================================================================
 
+        // Pre-allocate full output size to avoid repeated reallocations
+        size_t totalOutputSize = eventWords.size() * 4 + totalPayloadBytes;
+        output.reserve(totalOutputSize);
         output.resize(eventWords.size() * 4);
         uint32_t* outputWords = reinterpret_cast<uint32_t*>(output.data());
 
@@ -528,15 +538,15 @@ public:
         }
 
         // ========================================================================
-        // STEP 8: Append ROC Banks (Preserve Original Endianness)
+        // STEP 8: Append ROC Banks Directly (Preserve Original Endianness)
         // ========================================================================
 
-        for (const auto& rocBank : rocBanks) {
+        for (const auto& vs : validatedSlices) {
             size_t currentSize = output.size();
-            output.resize(currentSize + rocBank.size());
+            output.resize(currentSize + vs.rocSize);
             std::memcpy(output.data() + currentSize,
-                       rocBank.data(),
-                       rocBank.size());
+                       vs.rocData,
+                       vs.rocSize);
 
             // Pad to 4-byte boundary if needed
             while (output.size() % 4 != 0) {
@@ -673,8 +683,8 @@ public:
                 if (shouldBuild) {
                     std::vector<uint8_t> builtFrame;
 
-                    // Build frame without holding lock on the buffer
-                    AggregatedFrame frameCopy = frame;
+                    // Build frame without holding lock on the buffer (move to avoid copy)
+                    AggregatedFrame frameCopy = std::move(frame);
                     it = frameBuffer.erase(it);
                     lock.unlock();
 
@@ -974,8 +984,8 @@ void FrameBuilder::addTimeSlice(uint64_t timestamp, uint32_t frameNumber, uint16
     // Create time slice
     TimeSlice slice(timestamp, frameNumber, dataId, data, dataLen);
 
-    // Send to appropriate builder thread
-    builderThreads[threadIndex]->addTimeSlice(slice);
+    // Send to appropriate builder thread (move to avoid copy)
+    builderThreads[threadIndex]->addTimeSlice(std::move(slice));
     slicesAggregated++;
 }
 
