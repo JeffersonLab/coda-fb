@@ -2,13 +2,19 @@
  * E2SAR Reassembler Frame Builder - Multi-threaded Implementation
  *
  * This module extends the E2SAR receiver to aggregate multiple reassembled
- * frames belonging to the same time slice into a single EVIO-6 formatted
+ * data streams with the same frame number into a single EVIO-6 formatted
  * Time Frame Bank and sends the result to an ET system.
+ *
+ * AGGREGATION STRATEGY:
+ * - Slices are grouped by FRAME NUMBER (not timestamp)
+ * - Multiple streams send data for the same frame number
+ * - Aggregation completes when all expected streams arrive OR timeout occurs
+ * - Timestamps are validated for consistency but not used for grouping
  *
  * Multi-threaded design based on EMU PAGG (Primary Aggregator):
  * - Multiple parallel builder threads for high throughput
  * - Lock-free frame distribution across threads
- * - Each builder thread handles frames hashed to it by timestamp
+ * - Each builder thread handles frames hashed to it by frame number
  * - Parallel EVIO-6 bank construction and ET publishing
  *
  * Copyright (c) 2024, Jefferson Science Associates
@@ -73,13 +79,21 @@ struct TimeSlice {
 };
 
 /**
- * Aggregated frame containing all time slices with the same timestamp
+ * Aggregated frame containing all time slices with the same frame number
+ *
+ * AGGREGATION STRATEGY:
+ * - Slices are grouped by frame number (not timestamp)
+ * - Multiple streams send data for the same frame number
+ * - Aggregation completes when:
+ *   1. All expected streams have arrived, OR
+ *   2. Timeout occurs (partial frame)
+ * - Timestamp consistency is still validated as a sanity check
  */
 struct AggregatedFrame {
-    uint64_t timestamp;
-    uint32_t frameNumber;
+    uint64_t timestamp;       // Average timestamp (for validation and output)
+    uint32_t frameNumber;     // PRIMARY KEY for aggregation
     std::vector<TimeSlice> slices;
-    std::chrono::steady_clock::time_point arrivalTime;
+    std::chrono::steady_clock::time_point arrivalTime;  // When first slice arrived
 
     AggregatedFrame() : timestamp(0), frameNumber(0) {
         arrivalTime = std::chrono::steady_clock::now();
@@ -102,7 +116,7 @@ struct AggregatedFrame {
 
 /**
  * Individual Builder Thread
- * Each thread builds frames assigned to it by hash of timestamp
+ * Each thread builds frames assigned to it by hash of frame number
  */
 class BuilderThread {
 private:
@@ -125,8 +139,8 @@ private:
     int currentFileNumber;
     std::mutex fileMutex;
 
-    // Thread-local frame buffer
-    std::unordered_map<uint64_t, AggregatedFrame> frameBuffer;
+    // Thread-local frame buffer (keyed by frame number, not timestamp)
+    std::unordered_map<uint32_t, AggregatedFrame> frameBuffer;
     std::mutex frameMutex;
     std::condition_variable frameCV;
 
@@ -324,17 +338,22 @@ public:
 
     /**
      * Add a time slice to this builder's buffer
+     *
+     * AGGREGATION BY FRAME NUMBER:
+     * - Slices with the same frame number are aggregated together
+     * - Timeout starts when first slice of a given frame number arrives
+     * - Frame builds when all expected streams arrive OR timeout occurs
      */
     void addTimeSlice(TimeSlice&& slice) {
         std::lock_guard<std::mutex> lock(frameMutex);
 
-        // Find or create aggregated frame
-        auto& frame = frameBuffer[slice.timestamp];
-        if (frame.timestamp == 0) {
-            // New frame
-            frame.timestamp = slice.timestamp;
+        // Find or create aggregated frame BY FRAME NUMBER (not timestamp!)
+        auto& frame = frameBuffer[slice.frameNumber];
+        if (frame.frameNumber == 0) {
+            // New frame - first slice for this frame number
             frame.frameNumber = slice.frameNumber;
-            frame.arrivalTime = std::chrono::steady_clock::now();
+            frame.timestamp = slice.timestamp;  // Initial timestamp (will be averaged later)
+            frame.arrivalTime = std::chrono::steady_clock::now();  // Start timeout
         }
 
         frame.addSlice(std::move(slice));
@@ -684,10 +703,26 @@ public:
                 if (shouldBuild) {
                     std::vector<uint8_t> builtFrame;
 
+                    // Determine completion status for logging
+                    bool isComplete = frame.slices.size() >= static_cast<size_t>(expectedStreamCount);
+                    bool isTimeout = frame.isTimedOut(frameTimeoutMs);
+
                     // Build frame without holding lock on the buffer (move to avoid copy)
                     AggregatedFrame frameCopy = std::move(frame);
                     it = frameBuffer.erase(it);
                     lock.unlock();
+
+                    // Log aggregation completion (useful for debugging)
+                    if (isComplete) {
+                        std::cout << "[" << threadName << "] Frame " << frameCopy.frameNumber
+                                  << ": COMPLETE aggregation (" << frameCopy.slices.size()
+                                  << "/" << expectedStreamCount << " streams)" << std::endl;
+                    } else if (isTimeout) {
+                        std::cout << "[" << threadName << "] Frame " << frameCopy.frameNumber
+                                  << ": PARTIAL aggregation (" << frameCopy.slices.size()
+                                  << "/" << expectedStreamCount << " streams) - TIMEOUT after "
+                                  << frameTimeoutMs << "ms" << std::endl;
+                    }
 
                     // Check running flag again before expensive operations
                     if (!running) {
@@ -975,12 +1010,17 @@ bool FrameBuilder::initializeET() {
 
 /**
  * Add a reassembled time slice - distributes to appropriate builder thread
+ *
+ * THREAD DISTRIBUTION BY FRAME NUMBER:
+ * All slices with the same frame number go to the same builder thread.
+ * This ensures proper aggregation without cross-thread coordination.
  */
 void FrameBuilder::addTimeSlice(uint64_t timestamp, uint32_t frameNumber, uint16_t dataId,
                   uint8_t* data, size_t dataLen) {
 
-    // Hash timestamp to determine which builder thread handles this frame
-    int threadIndex = static_cast<int>(timestamp % builderThreadCount);
+    // Hash frame number to determine which builder thread handles this frame
+    // CRITICAL: Use frame number (not timestamp) so all slices of same frame go to same thread
+    int threadIndex = static_cast<int>(frameNumber % builderThreadCount);
 
     // Create time slice (transfers ownership of data buffer)
     TimeSlice slice(timestamp, frameNumber, dataId, data, dataLen);
