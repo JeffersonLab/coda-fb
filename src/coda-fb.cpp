@@ -646,14 +646,17 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
 
         if (frameBuilder != nullptr) {
             // Frame building mode: send to aggregator
+            // IMPORTANT: Ownership of eventBuf is transferred to frame builder!
             frameBuilder->addTimeSlice(
                 timestamp,       // 64-bit timestamp for synchronization
                 frameNumber,     // Frame sequence number
                 rocId,           // ROC/Stream identifier
-                eventBuf,        // Pointer to payload data (frame builder will strip CODA header)
+                eventBuf,        // Pointer to payload data (ownership transferred!)
                 eventSize        // Size of payload
             );
             // Note: buildEventsWritten is updated from frame builder statistics in statsReportingThread
+            // Note: eventBuf is NOT deleted here - frame builder now owns it
+            eventBuf = nullptr;  // Clear pointer to prevent accidental double-delete
         } else {
             // Reassembly-only mode: write raw frame directly to file
             if (outputFd >= 0) {
@@ -678,15 +681,15 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
                     buildEventsBytesTotal += eventSize;
                 }
             }
-        }
 
-        // ====================================================================
-        // STEP 6: Clean Up Frame Buffer
-        // ====================================================================
-        // The event buffer was allocated by the reassembler's recvEvent()
-        // We must delete it here to avoid memory leaks
-        delete[] eventBuf;
-        eventBuf = nullptr;
+            // ====================================================================
+            // STEP 6: Clean Up Frame Buffer
+            // ====================================================================
+            // The event buffer was allocated by the reassembler's recvEvent()
+            // We must delete it here to avoid memory leaks
+            delete[] eventBuf;
+            eventBuf = nullptr;
+        }
 
     }  // End of main reception loop
 

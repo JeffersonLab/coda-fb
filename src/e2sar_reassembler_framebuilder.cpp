@@ -61,14 +61,15 @@ struct TimeSlice {
     uint32_t frameNumber;    // Frame number
     uint16_t dataId;         // Data source ID (ROC ID, stream ID, etc.)
     uint16_t streamStatus;   // Stream status bits
-    std::vector<uint8_t> payload;  // Reassembled payload data
+    std::unique_ptr<uint8_t[]> payloadPtr;  // Owns the reassembled payload buffer
+    size_t payloadSize;                      // Size of payload in bytes
 
-    TimeSlice() : timestamp(0), frameNumber(0), dataId(0), streamStatus(0) {}
+    TimeSlice() : timestamp(0), frameNumber(0), dataId(0), streamStatus(0), payloadSize(0) {}
 
-    TimeSlice(uint64_t ts, uint32_t frame, uint16_t id, const uint8_t* data, size_t len)
-        : timestamp(ts), frameNumber(frame), dataId(id), streamStatus(0) {
-        payload.assign(data, data + len);
-    }
+    // Transfer ownership constructor - takes ownership of the buffer pointer
+    TimeSlice(uint64_t ts, uint32_t frame, uint16_t id, uint8_t* data, size_t len)
+        : timestamp(ts), frameNumber(frame), dataId(id), streamStatus(0)
+        , payloadPtr(data), payloadSize(len) {}
 };
 
 /**
@@ -374,8 +375,8 @@ public:
 
         for (const auto& slice : frame.slices) {
             // Verify minimum size (8 words = 32 bytes)
-            if (slice.payload.size() < 32) {
-                std::cerr << "[" << threadName << "] ERROR: Payload too small (" << slice.payload.size()
+            if (slice.payloadSize < 32) {
+                std::cerr << "[" << threadName << "] ERROR: Payload too small (" << slice.payloadSize
                          << " bytes), need at least 32 bytes for CODA header" << std::endl;
                 hasError = true;
                 continue;
@@ -383,7 +384,7 @@ public:
 
             // Validate word 8 = 0xc0da0100 (BIG endian)
             // Word 8 is at byte offset 28 (7*4)
-            const uint32_t* words = reinterpret_cast<const uint32_t*>(slice.payload.data());
+            const uint32_t* words = reinterpret_cast<const uint32_t*>(slice.payloadPtr.get());
             uint32_t magic = words[7];
 
             // Check if magic matches (either endianness - we'll accept both)
@@ -397,8 +398,8 @@ public:
 
             // Record validated slice (ROC data starts at byte 32)
             ValidatedSlice vs;
-            vs.rocData = slice.payload.data() + 32;
-            vs.rocSize = slice.payload.size() - 32;
+            vs.rocData = slice.payloadPtr.get() + 32;
+            vs.rocSize = slice.payloadSize - 32;
             validatedSlices.push_back(vs);
         }
 
@@ -976,12 +977,12 @@ bool FrameBuilder::initializeET() {
  * Add a reassembled time slice - distributes to appropriate builder thread
  */
 void FrameBuilder::addTimeSlice(uint64_t timestamp, uint32_t frameNumber, uint16_t dataId,
-                  const uint8_t* data, size_t dataLen) {
+                  uint8_t* data, size_t dataLen) {
 
     // Hash timestamp to determine which builder thread handles this frame
     int threadIndex = static_cast<int>(timestamp % builderThreadCount);
 
-    // Create time slice
+    // Create time slice (transfers ownership of data buffer)
     TimeSlice slice(timestamp, frameNumber, dataId, data, dataLen);
 
     // Send to appropriate builder thread (move to avoid copy)

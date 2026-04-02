@@ -127,14 +127,17 @@ public:
      * Thread-safe: Can be called from multiple threads simultaneously.
      * Slices are distributed to builder threads by timestamp hash.
      *
+     * IMPORTANT: This function takes OWNERSHIP of the data buffer.
+     * The caller must NOT delete the buffer after calling this function.
+     *
      * @param timestamp Frame timestamp (used for aggregation and distribution)
      * @param frameNumber Frame number
      * @param dataId Data source identifier (ROC ID, stream ID)
-     * @param data Pointer to reassembled payload data
+     * @param data Pointer to reassembled payload data (ownership transferred)
      * @param dataLen Length of payload data in bytes
      */
     void addTimeSlice(uint64_t timestamp, uint32_t frameNumber, uint16_t dataId,
-                      const uint8_t* data, size_t dataLen);
+                      uint8_t* data, size_t dataLen);
 
     /**
      * Start the frame builder and all builder threads
