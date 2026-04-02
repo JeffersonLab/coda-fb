@@ -149,10 +149,10 @@ private:
     std::atomic<bool> running{false};
 
     // Configuration
-    int timestampSlop;
-    int frameTimeoutMs;
+    int timestampSlop;         // Max allowed timestamp difference for validation (NOT aggregation)
+    int frameTimeoutMs;        // How long to wait for all expected streams before partial build
     int etEventSize;
-    int expectedStreamCount;  // Number of expected data streams
+    int expectedStreamCount;   // Number of expected data streams per frame number
 
     // Statistics (thread-local, no contention)
     uint64_t framesBuilt{0};
@@ -579,6 +579,13 @@ public:
 
     /**
      * Check timestamp consistency across slices
+     *
+     * DATA QUALITY VALIDATION (not aggregation):
+     * All slices in this frame were aggregated by frame number (exact match).
+     * This function validates that their timestamps are also reasonably close,
+     * as a sanity check on data quality.
+     *
+     * @return true if timestamps are inconsistent (exceeds slop), false if OK
      */
     bool checkTimestampConsistency(const AggregatedFrame& frame) const {
         if (frame.slices.empty()) return false;
@@ -592,7 +599,8 @@ public:
         }
 
         if (tsMax - tsMin > static_cast<uint64_t>(timestampSlop)) {
-            std::cerr << "[" << threadName << "] WARNING: Timestamp inconsistency! "
+            std::cerr << "[" << threadName << "] WARNING: Timestamp inconsistency in frame "
+                      << frame.frameNumber << "! "
                       << "Max=" << tsMax << ", Min=" << tsMin
                       << ", Diff=" << (tsMax - tsMin)
                       << ", Allowed=" << timestampSlop << std::endl;

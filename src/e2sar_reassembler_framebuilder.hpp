@@ -77,9 +77,9 @@ private:
     std::atomic<uint64_t> bytesWritten{0};
 
     // Configuration
-    int timestampSlop;
-    int frameTimeoutMs;
-    int expectedStreams;  // Number of expected data streams (UDP ports)
+    int timestampSlop;     // Max allowed timestamp difference for validation (NOT aggregation)
+    int frameTimeoutMs;    // How long to wait for all expected streams before partial build
+    int expectedStreams;   // Number of expected data streams per frame number
 
     // Private methods
     bool initializeET();
@@ -97,8 +97,12 @@ public:
      * @param filePrefix Prefix for output file names (default: "frames")
      * @param numBuilderThreads Number of parallel builder threads (default: 4)
      * @param eventSize Maximum ET event size in bytes (default: 1MB)
-     * @param tsSlop Maximum timestamp difference allowed (in ticks) (default: 100)
-     * @param timeout Frame timeout in milliseconds (default: 1000)
+     * @param tsSlop Maximum timestamp difference (in ticks) for validation within a frame.
+     *               Used for data quality checking only - does NOT affect aggregation.
+     *               Frames are aggregated by exact frame number match (default: 100)
+     * @param timeout Frame timeout in milliseconds - how long to wait for all expected
+     *                streams before building a partial frame (default: 1000)
+     * @param expectedStreams Number of expected data streams per frame number
      *
      * Note: At least one output mode (ET or file) must be enabled.
      *       - To enable ET output: provide valid etFile and stationName

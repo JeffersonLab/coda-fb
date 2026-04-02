@@ -868,11 +868,15 @@ int main(int argc, char **argv)
 
     // Frame building options
     opts("timestamp-slop", po::value<int>(&timestampSlop)->default_value(100),
-         "maximum timestamp difference allowed in ticks (default: 100)");
+         "maximum timestamp difference (in ticks) allowed between streams within the same frame number - "
+         "used for data quality validation only, NOT for aggregation. "
+         "Frames are aggregated by exact frame number match (default: 100)");
     opts("frame-timeout", po::value<int>(&frameTimeout)->default_value(1000),
-         "frame building timeout in milliseconds (default: 1000)");
+         "frame building timeout in milliseconds - how long to wait for all expected streams "
+         "before building a partial frame (default: 1000)");
     opts("expected-streams", po::value<int>(&expectedStreams)->default_value(1),
-         "number of expected data streams for frame aggregation (default: 1)");
+         "number of expected data streams per frame number - frame builds immediately when all "
+         "streams arrive, or after timeout if incomplete (default: 1)");
 
     // Performance parameters
     opts("threads,t", po::value<size_t>(&numThreads)->default_value(1), 
