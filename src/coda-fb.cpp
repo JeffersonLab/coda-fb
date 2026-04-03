@@ -54,6 +54,7 @@ int globalOutputFd{-1};  // Global file descriptor for single output file
 std::mutex fileMutex;    // Mutex to protect file writes
 int verboseFrameInfo = 0;  // Verbose frame logging: 0=off, 1=continuous, 2=first 100 frames then exit
 std::atomic<uint64_t> framesReceivedCount{0};  // Counter for verbose mode 2
+bool verboseReassemble = false;  // Print event numbers for all streams (reassembly-only mode)
 
 // Note: Frame builder is always used when ENABLE_FRAME_BUILDER is defined
 
@@ -680,6 +681,19 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
             eventBuf = nullptr;  // Clear pointer to prevent accidental double-delete
         } else {
             // Reassembly-only mode: write raw frame directly to file
+
+            // ====================================================================
+            // VERBOSE REASSEMBLE: Print event numbers for all streams
+            // ====================================================================
+            if (verboseReassemble) {
+                std::cout << "[REASSEMBLE] EventNum=" << std::setw(8) << eventNum
+                          << " | DataID=" << std::setw(4) << dataId
+                          << " | ROC_ID=" << std::setw(4) << rocId
+                          << " | PayloadFrameNum=" << std::setw(8) << payloadFrameNum
+                          << " | Size=" << std::setw(8) << eventSize << " bytes"
+                          << std::endl;
+            }
+
             if (outputFd >= 0) {
                 // Acquire mutex to ensure thread-safe file writing
                 std::lock_guard<std::mutex> lock(fileMutex);
@@ -901,6 +915,9 @@ int main(int argc, char **argv)
     opts("verbose-frames", po::value<int>(&verboseFrameInfo)->default_value(0),
          "verbose frame logging mode: 0=off, 1=print all frames continuously, "
          "2=print first 100 frames then exit (for debugging stream alignment) (default: 0)");
+    opts("verbose-reassemble", po::bool_switch(&verboseReassemble)->default_value(false),
+         "print reassembler event numbers for all streams (works in reassembly-only mode, "
+         "i.e., --enable-framebuild=0) (default: false)");
 
     // Performance parameters
     opts("threads,t", po::value<size_t>(&numThreads)->default_value(1), 
