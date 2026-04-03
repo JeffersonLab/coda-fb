@@ -723,29 +723,82 @@ public:
     }
 };
 
+void printHelp(const char* progName) {
+    std::cout << "EVIO6 Event Parser and Validator\n";
+    std::cout << "=================================\n\n";
+    std::cout << "Usage: " << progName << " <evio_file> [OPTIONS]\n\n";
+    std::cout << "This program parses and validates EVIO6-format frame-built event files\n";
+    std::cout << "produced by coda-fb. It validates the EVIO6 structure, checks headers,\n";
+    std::cout << "and can decode FADC250 detector data.\n\n";
+    std::cout << "Arguments:\n";
+    std::cout << "  <evio_file>     Path to EVIO6 file to parse (required)\n\n";
+    std::cout << "Options:\n";
+    std::cout << "  -h, --help      Show this help message and exit\n";
+    std::cout << "  --verbose       Show detailed EVIO6 structure including:\n";
+    std::cout << "                  - File and record headers with all fields\n";
+    std::cout << "                  - Bank, segment, and tag information\n";
+    std::cout << "                  - Frame numbers, timestamps, and ROC IDs\n";
+    std::cout << "                  - Payload sizes and structure details\n";
+    std::cout << "  --fadc-verbose  Decode and display FADC250 detector hits:\n";
+    std::cout << "                  - Crate: ROC ID from data source\n";
+    std::cout << "                  - Slot: Module slot number (0-20)\n";
+    std::cout << "                  - Channel: ADC channel (0-15)\n";
+    std::cout << "                  - Charge: Integrated pulse charge (13-bit ADC)\n";
+    std::cout << "                  - Time: Absolute hit time in nanoseconds\n\n";
+    std::cout << "Exit Codes:\n";
+    std::cout << "  0  File is valid EVIO6 format\n";
+    std::cout << "  1  Validation errors or file cannot be opened\n\n";
+    std::cout << "Examples:\n";
+    std::cout << "  # Validate file structure only (quiet mode)\n";
+    std::cout << "  " << progName << " frames_thread0_file0000.evio\n\n";
+    std::cout << "  # Show detailed EVIO6 structure\n";
+    std::cout << "  " << progName << " frames_thread0_file0000.evio --verbose\n\n";
+    std::cout << "  # Decode and display FADC250 hits\n";
+    std::cout << "  " << progName << " frames_thread0_file0000.evio --fadc-verbose\n\n";
+    std::cout << "  # Show both structure and FADC250 data\n";
+    std::cout << "  " << progName << " frames_thread0_file0000.evio --verbose --fadc-verbose\n\n";
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <evio_file> [--verbose] [--fadc-verbose]\n";
-        std::cerr << "\nThis program parses and validates EVIO6-format frame-built\n";
-        std::cerr << "event files produced by coda-fb.\n";
-        std::cerr << "\nOptions:\n";
-        std::cerr << "  --verbose       Show detailed EVIO structure\n";
-        std::cerr << "  --fadc-verbose  Show decoded FADC250 hits\n";
+        printHelp(argv[0]);
         return 1;
     }
 
-    std::string filename = argv[1];
+    std::string filename;
     bool verbose = false;
     bool fadcVerbose = false;
 
-    // Parse flags
-    for (int i = 2; i < argc; i++) {
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--verbose") {
+        if (arg == "-h" || arg == "--help") {
+            printHelp(argv[0]);
+            return 0;
+        } else if (arg == "--verbose") {
             verbose = true;
         } else if (arg == "--fadc-verbose") {
             fadcVerbose = true;
+        } else if (arg[0] != '-') {
+            // First non-option argument is the filename
+            if (filename.empty()) {
+                filename = arg;
+            } else {
+                std::cerr << "ERROR: Multiple input files specified\n";
+                std::cerr << "Use '" << argv[0] << " --help' for usage information\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "ERROR: Unknown option: " << arg << "\n";
+            std::cerr << "Use '" << argv[0] << " --help' for usage information\n";
+            return 1;
         }
+    }
+
+    if (filename.empty()) {
+        std::cerr << "ERROR: No input file specified\n";
+        std::cerr << "Use '" << argv[0] << " --help' for usage information\n";
+        return 1;
     }
 
     std::cout << "EVIO6 Event Parser and Validator\n";
