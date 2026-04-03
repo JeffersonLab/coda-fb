@@ -75,6 +75,10 @@ coda-fb --uri 'ejfat://...' --ip 192.168.1.100 --port 10000 \
 - `--fb-output-dir`: Output directory for EVIO6 files
 - `--et-file`: ET system file path
 - `--expected-streams N`: Expected data streams for aggregation
+- `--framenumber-slop N`: Max frame number difference for validation after correction (default: 0)
+- `--frame-timeout N`: Frame building timeout in milliseconds (default: 1000)
+- `--verbose-frames`: Print all frames and builder alignment messages
+- `--verbose-reassemble`: Print reassembler event numbers (reassembly-only mode)
 
 ### evio_event_parser (Validator)
 
