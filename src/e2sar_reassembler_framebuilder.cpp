@@ -202,6 +202,7 @@ private:
     int frameTimeoutMs;        // How long to wait for all expected streams before partial build
     int etEventSize;
     int expectedStreamCount;   // Number of expected data streams per frame number
+    bool verboseLogging;       // Enable verbose logging of frame building progress
 
     // Statistics (thread-local, no contention)
     uint64_t framesBuilt{0};
@@ -216,7 +217,7 @@ public:
                   int fnSlop, int timeout, int evtSize,
                   bool enableET, bool enableFile,
                   const std::string& fileDir, const std::string& filePrefix,
-                  int numExpectedStreams)
+                  int numExpectedStreams, bool verbose)
         : threadIndex(index)
         , threadCount(count)
         , etSystem(sys)
@@ -232,6 +233,7 @@ public:
         , frameTimeoutMs(timeout)
         , etEventSize(evtSize)
         , expectedStreamCount(numExpectedStreams)
+        , verboseLogging(verbose)
     {
         threadName = "Builder-" + std::to_string(index);
     }
@@ -992,19 +994,21 @@ public:
             // Release lock before expensive build/send operations
             lock.unlock();
 
-            // Step 5: Log what we're doing (using corrected event number)
-            if (allAligned && isComplete) {
-                std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
-                          << ": ALIGNED & COMPLETE (" << aggregatedFrame.slices.size()
-                          << "/" << expectedStreamCount << " streams)" << std::endl;
-            } else if (allAligned && !isComplete) {
-                std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
-                          << ": ALIGNED but PARTIAL (" << aggregatedFrame.slices.size()
-                          << "/" << expectedStreamCount << " streams) - TIMEOUT" << std::endl;
-            } else {
-                std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
-                          << ": NOT ALIGNED - advancing " << aggregatedFrame.slices.size()
-                          << " lagging stream(s)" << std::endl;
+            // Step 5: Log what we're doing (using corrected event number) - only if verbose enabled
+            if (verboseLogging) {
+                if (allAligned && isComplete) {
+                    std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
+                              << ": ALIGNED & COMPLETE (" << aggregatedFrame.slices.size()
+                              << "/" << expectedStreamCount << " streams)" << std::endl;
+                } else if (allAligned && !isComplete) {
+                    std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
+                              << ": ALIGNED but PARTIAL (" << aggregatedFrame.slices.size()
+                              << "/" << expectedStreamCount << " streams) - TIMEOUT" << std::endl;
+                } else {
+                    std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
+                              << ": NOT ALIGNED - advancing " << aggregatedFrame.slices.size()
+                              << " lagging stream(s)" << std::endl;
+                }
             }
 
             // Check if we should stop before expensive operations
@@ -1136,7 +1140,8 @@ FrameBuilder::FrameBuilder(const std::string& etFile,
              int eventSize,
              int fnSlop,
              int timeout,
-             int numExpectedStreams)
+             int numExpectedStreams,
+             bool verboseMode)
     : etSystemFile(etFile)
     , etHostName(etHost)
     , etPort(etPort)
@@ -1149,6 +1154,7 @@ FrameBuilder::FrameBuilder(const std::string& etFile,
     , frameNumberSlop(fnSlop)
     , frameTimeoutMs(timeout)
     , expectedStreams(numExpectedStreams)
+    , verbose(verboseMode)
 {
     etSystem = nullptr;
 
@@ -1369,7 +1375,8 @@ bool FrameBuilder::start() {
             enableFileOutput,
             fileOutputDir,
             fileOutputPrefix,
-            expectedStreams
+            expectedStreams,
+            verbose
         );
         builder->start();
         builderThreads.push_back(std::move(builder));

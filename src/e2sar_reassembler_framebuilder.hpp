@@ -80,6 +80,7 @@ private:
     int frameNumberSlop;   // Max allowed frame number difference for validation (after correction)
     int frameTimeoutMs;    // How long to wait for all expected streams before partial build
     int expectedStreams;   // Number of expected data streams per frame number
+    bool verbose;          // Enable verbose logging of frame building progress
 
     // Private methods
     bool initializeET();
@@ -104,6 +105,7 @@ public:
      * @param timeout Frame timeout in milliseconds - how long to wait for all expected
      *                streams before building a partial frame (default: 1000)
      * @param expectedStreams Number of expected data streams per frame number
+     * @param verbose Enable verbose logging of frame building progress (default: false)
      *
      * Note: At least one output mode (ET or file) must be enabled.
      *       - To enable ET output: provide valid etFile and stationName
@@ -119,7 +121,8 @@ public:
                  int eventSize = 1024*1024,
                  int fnSlop = 0,
                  int timeout = 1000,
-                 int expectedStreams = 1);
+                 int expectedStreams = 1,
+                 bool verbose = false);
 
     /**
      * Destructor

@@ -52,8 +52,7 @@ e2sar::FrameBuilder *frameBuilderPtr{nullptr};  // Global frame builder pointer 
 std::atomic<bool> handlerTriggered{false};
 int globalOutputFd{-1};  // Global file descriptor for single output file
 std::mutex fileMutex;    // Mutex to protect file writes
-int verboseFrameInfo = 0;  // Verbose frame logging: 0=off, 1=continuous, 2=first 100 frames then exit
-std::atomic<uint64_t> framesReceivedCount{0};  // Counter for verbose mode 2
+bool verboseFrameInfo = false;  // Verbose frame logging: print all frames and builder messages
 bool verboseReassemble = false;  // Print event numbers for all streams (reassembly-only mode)
 
 // Note: Frame builder is always used when ENABLE_FRAME_BUILDER is defined
@@ -635,23 +634,13 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
         // ====================================================================
         // VERBOSE LOGGING: Print frame information if requested
         // ====================================================================
-        if (verboseFrameInfo >= 1) {
+        if (verboseFrameInfo) {
             std::cout << "[FRAME] EventNum=" << std::setw(8) << eventNum
                       << " | Timestamp=" << std::setw(16) << timestamp
                       << " | ROC_ID=" << std::setw(4) << rocId
                       << " | PayloadFrameNum=" << std::setw(8) << payloadFrameNum
                       << " | Size=" << std::setw(8) << eventSize << " bytes"
                       << std::endl;
-
-            // Mode 2: Print first 100 frames then exit
-            if (verboseFrameInfo == 2) {
-                framesReceivedCount++;
-                if (framesReceivedCount >= 100) {
-                    std::cout << "\n=== Printed first 100 frames, exiting as requested ===" << std::endl;
-                    threadsRunning = false;  // Trigger clean shutdown
-                    break;  // Exit the reception loop
-                }
-            }
         }
 
         // ====================================================================
@@ -912,9 +901,9 @@ int main(int argc, char **argv)
     opts("expected-streams", po::value<int>(&expectedStreams)->default_value(1),
          "number of expected data streams per frame number - frame builds immediately when all "
          "streams arrive, or after timeout if incomplete (default: 1)");
-    opts("verbose-frames", po::value<int>(&verboseFrameInfo)->default_value(0),
-         "verbose frame logging mode: 0=off, 1=print all frames continuously, "
-         "2=print first 100 frames then exit (for debugging stream alignment) (default: 0)");
+    opts("verbose-frames", po::bool_switch(&verboseFrameInfo)->default_value(false),
+         "enable verbose frame logging: print all frames and frame builder alignment messages "
+         "(default: false)");
     opts("verbose-reassemble", po::bool_switch(&verboseReassemble)->default_value(false),
          "print reassembler event numbers for all streams (works in reassembly-only mode, "
          "i.e., --enable-framebuild=0) (default: false)");
@@ -1209,7 +1198,8 @@ int main(int argc, char **argv)
                 etEventSize,
                 timestampSlop,
                 frameTimeout,
-                expectedStreams  // Number of expected data streams for aggregation
+                expectedStreams,  // Number of expected data streams for aggregation
+                verboseFrameInfo  // Enable verbose logging
             );
 
             if (!frameBuilderPtr->start()) {
