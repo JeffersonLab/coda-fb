@@ -5,15 +5,42 @@
  * data streams with the same frame number into a single EVIO-6 formatted
  * Time Frame Bank and sends the result to an ET system.
  *
- * AGGREGATION STRATEGY:
- * - Slices are grouped by FRAME NUMBER (not timestamp)
- * - Multiple streams send data for the same frame number
- * - Aggregation completes when all expected streams arrive OR timeout occurs
- * - Timestamps are validated for consistency but not used for grouping
+ * ALIGNMENT-BASED AGGREGATION STRATEGY:
+ * =====================================
+ * After reassembly, each input stream places its reassembled frames into its
+ * own stream-dedicated FIFO queue. The frame-building thread reads frames from
+ * these per-stream FIFOs, verifies that frame numbers are aligned across streams,
+ * and builds aggregated frames only when alignment is maintained.
+ *
+ * ALGORITHM:
+ * 1. Each stream has its own FIFO queue of reassembled frames
+ * 2. Builder thread finds minimum frame number across all non-empty FIFOs
+ * 3. Checks if ALL streams are aligned (all have same frame number at head)
+ * 4. If ALIGNED:
+ *    - Consume from all FIFOs with this frame number
+ *    - Build complete aggregated frame
+ *    - Send to ET/file output
+ * 5. If NOT ALIGNED:
+ *    - Consume ONLY from FIFOs with the minimum frame number (lagging streams)
+ *    - Build partial frame for the lagging streams
+ *    - Continue advancing only the lagging streams until alignment is restored
+ * 6. After alignment is restored, resume reading from all FIFOs normally
+ *
+ * KEY BEHAVIORS:
+ * - Never consume from a FIFO that already has a larger frame number
+ * - Always advance only the streams with smaller frame numbers
+ * - Only build complete frames when all streams show the same frame number
+ * - Timeout handling: Force build after timeout even if not all streams present
+ *
+ * SYNCHRONIZATION & THREAD SAFETY:
+ * - Stream FIFOs are protected by mutex
+ * - Condition variable wakes builder thread when new data arrives
+ * - Lock released during expensive build/send operations
+ * - Frame number distribution ensures same frame goes to same builder thread
  *
  * Multi-threaded design based on EMU PAGG (Primary Aggregator):
  * - Multiple parallel builder threads for high throughput
- * - Lock-free frame distribution across threads
+ * - Lock-free frame distribution across threads by frame number hash
  * - Each builder thread handles frames hashed to it by frame number
  * - Parallel EVIO-6 bank construction and ET publishing
  *
@@ -79,15 +106,13 @@ struct TimeSlice {
 };
 
 /**
- * Aggregated frame containing all time slices with the same frame number
+ * Aggregated frame containing time slices for a single frame number
  *
- * AGGREGATION STRATEGY:
- * - Slices are grouped by frame number (not timestamp)
- * - Multiple streams send data for the same frame number
- * - Aggregation completes when:
- *   1. All expected streams have arrived, OR
- *   2. Timeout occurs (partial frame)
- * - Timestamp consistency is still validated as a sanity check
+ * ALIGNMENT-BASED AGGREGATION:
+ * - Slices are collected from per-stream FIFOs when aligned on same frame number
+ * - This structure is built temporarily during the aggregation process
+ * - May contain slices from all streams (complete) or subset (partial/lagging)
+ * - Timestamp consistency is validated as a data quality check
  */
 struct AggregatedFrame {
     uint64_t timestamp;       // Average timestamp (for validation and output)
@@ -139,8 +164,14 @@ private:
     int currentFileNumber;
     std::mutex fileMutex;
 
-    // Thread-local frame buffer (keyed by frame number, not timestamp)
-    std::unordered_map<uint32_t, AggregatedFrame> frameBuffer;
+    // ALIGNMENT-BASED FRAME BUILDING:
+    // Each stream has its own FIFO queue of reassembled frames.
+    // Frames are built only when all streams are aligned on the same frame number.
+    std::unordered_map<uint16_t, std::queue<TimeSlice>> streamFIFOs;  // Key: dataId (stream ID)
+
+    // Track first arrival time for each frame number (for timeout handling)
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> frameArrivalTimes;
+
     std::mutex frameMutex;
     std::condition_variable frameCV;
 
@@ -337,26 +368,26 @@ public:
     }
 
     /**
-     * Add a time slice to this builder's buffer
+     * Add a time slice to this builder's per-stream FIFO
      *
-     * AGGREGATION BY FRAME NUMBER:
-     * - Slices with the same frame number are aggregated together
-     * - Timeout starts when first slice of a given frame number arrives
-     * - Frame builds when all expected streams arrive OR timeout occurs
+     * ALIGNMENT-BASED AGGREGATION:
+     * - Each stream has its own FIFO queue
+     * - Slices are enqueued to their stream's FIFO
+     * - Builder thread will check alignment and consume only when aligned
      */
     void addTimeSlice(TimeSlice&& slice) {
         std::lock_guard<std::mutex> lock(frameMutex);
 
-        // Find or create aggregated frame BY FRAME NUMBER (not timestamp!)
-        auto& frame = frameBuffer[slice.frameNumber];
-        if (frame.frameNumber == 0) {
-            // New frame - first slice for this frame number
-            frame.frameNumber = slice.frameNumber;
-            frame.timestamp = slice.timestamp;  // Initial timestamp (will be averaged later)
-            frame.arrivalTime = std::chrono::steady_clock::now();  // Start timeout
+        uint16_t streamId = slice.dataId;
+        uint32_t frameNum = slice.frameNumber;
+
+        // Track first arrival time for this frame number (for timeout)
+        if (frameArrivalTimes.find(frameNum) == frameArrivalTimes.end()) {
+            frameArrivalTimes[frameNum] = std::chrono::steady_clock::now();
         }
 
-        frame.addSlice(std::move(slice));
+        // Enqueue slice to its stream's FIFO
+        streamFIFOs[streamId].push(std::move(slice));
         slicesProcessed++;
 
         // Signal builder thread
@@ -679,101 +710,215 @@ public:
     }
 
     /**
-     * Builder thread main loop
+     * Get the minimum frame number across all non-empty stream FIFOs
+     * Returns {found, minFrameNumber}
+     */
+    std::pair<bool, uint32_t> getMinimumFrameNumber() {
+        // NOTE: Caller must hold frameMutex
+        uint32_t minFrame = UINT32_MAX;
+        bool found = false;
+
+        for (const auto& [streamId, fifo] : streamFIFOs) {
+            if (!fifo.empty()) {
+                minFrame = std::min(minFrame, fifo.front().frameNumber);
+                found = true;
+            }
+        }
+
+        return {found, minFrame};
+    }
+
+    /**
+     * Check if all non-empty stream FIFOs are aligned on the given frame number
+     * Returns: {aligned, list of stream IDs that have this frame number}
+     */
+    std::pair<bool, std::vector<uint16_t>> checkAlignment(uint32_t frameNumber) {
+        // NOTE: Caller must hold frameMutex
+        std::vector<uint16_t> alignedStreams;
+        bool allAligned = true;
+
+        for (const auto& [streamId, fifo] : streamFIFOs) {
+            if (!fifo.empty()) {
+                if (fifo.front().frameNumber == frameNumber) {
+                    alignedStreams.push_back(streamId);
+                } else {
+                    // Found a stream with different frame number
+                    allAligned = false;
+                }
+            }
+        }
+
+        return {allAligned, alignedStreams};
+    }
+
+    /**
+     * Check if a frame number has timed out
+     */
+    bool hasFrameTimedOut(uint32_t frameNumber) {
+        // NOTE: Caller must hold frameMutex
+        auto it = frameArrivalTimes.find(frameNumber);
+        if (it == frameArrivalTimes.end()) {
+            return false;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second);
+        return elapsed.count() > frameTimeoutMs;
+    }
+
+    /**
+     * Builder thread main loop - ALIGNMENT-BASED FRAME BUILDING
+     *
+     * ALGORITHM:
+     * 1. Find minimum frame number across all stream FIFOs
+     * 2. Check if all streams are aligned (all have this frame number)
+     * 3. If aligned → consume from all streams and build complete frame
+     * 4. If NOT aligned → consume only from streams with minimum frame number
+     * 5. Handle timeout → force build if waiting too long
      */
     void threadFunc() {
         while (true) {
             std::unique_lock<std::mutex> lock(frameMutex);
 
-            // Wait for frames to build or timeout
+            // Wait for data to arrive or check periodically
             frameCV.wait_for(lock, std::chrono::milliseconds(frameTimeoutMs / 2),
-                [this]() { return !frameBuffer.empty() || !running; });
+                [this]() {
+                    // Wake up if any stream has data OR we're stopping
+                    for (const auto& [streamId, fifo] : streamFIFOs) {
+                        if (!fifo.empty()) return true;
+                    }
+                    return !running;
+                });
 
-            // Exit immediately if stopped (don't process remaining frames)
+            // Exit immediately if stopped
             if (!running) {
                 break;
             }
 
-            // Process frames that are ready
-            auto it = frameBuffer.begin();
+            // ================================================================
+            // ALIGNMENT-BASED FRAME BUILDING ALGORITHM
+            // ================================================================
 
-            while (it != frameBuffer.end() && running) {
-                AggregatedFrame& frame = it->second;
+            // Step 1: Find minimum frame number across all non-empty FIFOs
+            auto [hasData, minFrameNumber] = getMinimumFrameNumber();
 
-                // Check if frame should be built
-                // Build immediately if:
-                // 1. Frame has all expected slices (complete aggregation), OR
-                // 2. Frame has timed out (incomplete aggregation or single stream)
-                bool shouldBuild = !frame.slices.empty() &&
-                                   (frame.slices.size() >= static_cast<size_t>(expectedStreamCount) ||
-                                    frame.isTimedOut(frameTimeoutMs));
+            if (!hasData) {
+                // No data available, wait for more
+                continue;
+            }
 
-                if (shouldBuild) {
-                    std::vector<uint8_t> builtFrame;
+            // Step 2: Check alignment - which streams have this minimum frame number?
+            auto [allAligned, streamsWithMinFrame] = checkAlignment(minFrameNumber);
 
-                    // Determine completion status for logging
-                    bool isComplete = frame.slices.size() >= static_cast<size_t>(expectedStreamCount);
-                    bool isTimeout = frame.isTimedOut(frameTimeoutMs);
+            if (streamsWithMinFrame.empty()) {
+                // Should never happen, but handle gracefully
+                continue;
+            }
 
-                    // Build frame without holding lock on the buffer (move to avoid copy)
-                    AggregatedFrame frameCopy = std::move(frame);
-                    it = frameBuffer.erase(it);
-                    lock.unlock();
+            // Step 3: Determine if we should build a frame
+            bool shouldBuild = false;
+            bool isComplete = false;
+            bool isTimeout = hasFrameTimedOut(minFrameNumber);
 
-                    // Log aggregation completion (useful for debugging)
-                    if (isComplete) {
-                        std::cout << "[" << threadName << "] Frame " << frameCopy.frameNumber
-                                  << ": COMPLETE aggregation (" << frameCopy.slices.size()
-                                  << "/" << expectedStreamCount << " streams)" << std::endl;
-                    } else if (isTimeout) {
-                        std::cout << "[" << threadName << "] Frame " << frameCopy.frameNumber
-                                  << ": PARTIAL aggregation (" << frameCopy.slices.size()
-                                  << "/" << expectedStreamCount << " streams) - TIMEOUT after "
-                                  << frameTimeoutMs << "ms" << std::endl;
-                    }
+            if (allAligned && streamsWithMinFrame.size() >= static_cast<size_t>(expectedStreamCount)) {
+                // CASE 1: All streams aligned AND all expected streams present
+                shouldBuild = true;
+                isComplete = true;
+            } else if (allAligned && isTimeout) {
+                // CASE 2: All present streams aligned, but some missing and timed out
+                shouldBuild = true;
+                isComplete = false;
+            } else if (!allAligned) {
+                // CASE 3: NOT aligned - advance only the lagging streams (with min frame number)
+                shouldBuild = true;
+                isComplete = false;
+            }
 
-                    // Check running flag again before expensive operations
+            if (!shouldBuild) {
+                // Wait for more data or timeout
+                continue;
+            }
+
+            // Step 4: Consume slices from appropriate streams
+            // - If aligned: consume from ALL streams with this frame number
+            // - If NOT aligned: consume ONLY from streams with minimum frame number (lagging streams)
+            AggregatedFrame aggregatedFrame;
+            aggregatedFrame.frameNumber = minFrameNumber;
+            aggregatedFrame.timestamp = 0;  // Will calculate average
+
+            for (uint16_t streamId : streamsWithMinFrame) {
+                auto& fifo = streamFIFOs[streamId];
+                if (!fifo.empty() && fifo.front().frameNumber == minFrameNumber) {
+                    // Pop slice from this stream's FIFO
+                    TimeSlice slice = std::move(fifo.front());
+                    fifo.pop();
+                    aggregatedFrame.addSlice(std::move(slice));
+                }
+            }
+
+            // Clean up timeout tracking for this frame number if all streams consumed it
+            if (allAligned) {
+                frameArrivalTimes.erase(minFrameNumber);
+            }
+
+            // Release lock before expensive build/send operations
+            lock.unlock();
+
+            // Step 5: Log what we're doing
+            if (allAligned && isComplete) {
+                std::cout << "[" << threadName << "] Frame " << minFrameNumber
+                          << ": ALIGNED & COMPLETE (" << aggregatedFrame.slices.size()
+                          << "/" << expectedStreamCount << " streams)" << std::endl;
+            } else if (allAligned && !isComplete) {
+                std::cout << "[" << threadName << "] Frame " << minFrameNumber
+                          << ": ALIGNED but PARTIAL (" << aggregatedFrame.slices.size()
+                          << "/" << expectedStreamCount << " streams) - TIMEOUT" << std::endl;
+            } else {
+                std::cout << "[" << threadName << "] Frame " << minFrameNumber
+                          << ": NOT ALIGNED - advancing " << aggregatedFrame.slices.size()
+                          << " lagging stream(s)" << std::endl;
+            }
+
+            // Check if we should stop before expensive operations
+            if (!running) {
+                lock.lock();
+                break;
+            }
+
+            // Step 6: Build EVIO-6 frame
+            std::vector<uint8_t> builtFrame;
+            if (buildEVIO6Frame(aggregatedFrame, builtFrame)) {
+                bool success = true;
+
+                // Check if we should stop before ET/file operations
+                if (!running) {
+                    lock.lock();
+                    break;
+                }
+
+                // Send to ET if enabled
+                if (useET && running) {
+                    success = sendToET(builtFrame) && success;
+
+                    // Check again after potentially blocking ET call
                     if (!running) {
                         lock.lock();
                         break;
                     }
+                }
 
-                    // Build EVIO-6 frame
-                    if (buildEVIO6Frame(frameCopy, builtFrame)) {
-                        bool success = true;
+                // Write to file if enabled
+                if (useFileOutput && running) {
+                    success = writeToFile(builtFrame) && success;
+                }
 
-                        // Check if we should stop before ET/file operations
-                        if (!running) {
-                            lock.lock();
-                            break;
-                        }
-
-                        // Send to ET if enabled
-                        if (useET && running) {
-                            success = sendToET(builtFrame) && success;
-
-                            // Check again after potentially blocking ET call
-                            if (!running) {
-                                lock.lock();
-                                break;
-                            }
-                        }
-
-                        // Write to file if enabled
-                        if (useFileOutput && running) {
-                            success = writeToFile(builtFrame) && success;
-                        }
-
-                        if (success) {
-                            framesBuilt++;
-                        }
-                    }
-
-                    lock.lock();
-                } else {
-                    ++it;
+                if (success) {
+                    framesBuilt++;
                 }
             }
+
+            // Reacquire lock for next iteration
+            lock.lock();
         }
 
         std::cout << "[" << threadName << "] Builder thread stopped" << std::endl;
@@ -1017,11 +1162,15 @@ bool FrameBuilder::initializeET() {
 }
 
 /**
- * Add a reassembled time slice - distributes to appropriate builder thread
+ * Add a reassembled time slice - distributes to appropriate builder thread's per-stream FIFO
  *
  * THREAD DISTRIBUTION BY FRAME NUMBER:
  * All slices with the same frame number go to the same builder thread.
- * This ensures proper aggregation without cross-thread coordination.
+ * This ensures proper alignment checking without cross-thread coordination.
+ *
+ * STREAM FIFO ARCHITECTURE:
+ * Each builder thread maintains separate FIFO queues for each stream.
+ * Slices are enqueued to their stream's FIFO and processed by the alignment algorithm.
  */
 void FrameBuilder::addTimeSlice(uint64_t timestamp, uint32_t frameNumber, uint16_t dataId,
                   uint8_t* data, size_t dataLen) {
@@ -1033,7 +1182,7 @@ void FrameBuilder::addTimeSlice(uint64_t timestamp, uint32_t frameNumber, uint16
     // Create time slice (transfers ownership of data buffer)
     TimeSlice slice(timestamp, frameNumber, dataId, data, dataLen);
 
-    // Send to appropriate builder thread (move to avoid copy)
+    // Send to appropriate builder thread's per-stream FIFO (move to avoid copy)
     builderThreads[threadIndex]->addTimeSlice(std::move(slice));
     slicesAggregated++;
 }
