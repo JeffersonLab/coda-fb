@@ -623,24 +623,22 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
         // ====================================================================
         // STEP 4: Use Extracted Metadata from Payload
         // ====================================================================
-        // IMPORTANT: We use metadata extracted from the EVIO payload structure
-        // rather than the values provided by the reassembler (eventNum, dataId).
-        // This ensures we have the actual timestamp and ROC ID from the data stream.
-        //
-        // Why? The reassembler's eventNum and dataId may not match the actual
-        // values embedded in the payload, especially in multi-stream scenarios.
+        // Extract timestamp and ROC ID from payload for data quality.
+        // Use reassembler's eventNum for frame building (stream-independent numbering).
 
         uint64_t timestamp   = meta.timestamp;     // 64-bit timestamp from payload words 15-16
-        uint32_t frameNumber = meta.frameNumber;   // Frame number from payload word 14
+        uint32_t frameNumber = eventNum;           // Use reassembler's event number for alignment
         uint16_t rocId       = meta.dataId;        // ROC ID from payload word 10
+        uint32_t payloadFrameNum = meta.frameNumber;  // Frame number from payload (for reference)
 
         // ====================================================================
         // VERBOSE LOGGING: Print frame information if requested
         // ====================================================================
         if (verboseFrameInfo >= 1) {
-            std::cout << "[FRAME] FrameNum=" << std::setw(8) << frameNumber
+            std::cout << "[FRAME] EventNum=" << std::setw(8) << eventNum
                       << " | Timestamp=" << std::setw(16) << timestamp
                       << " | ROC_ID=" << std::setw(4) << rocId
+                      << " | PayloadFrameNum=" << std::setw(8) << payloadFrameNum
                       << " | Size=" << std::setw(8) << eventSize << " bytes"
                       << std::endl;
 
