@@ -52,7 +52,8 @@ e2sar::FrameBuilder *frameBuilderPtr{nullptr};  // Global frame builder pointer 
 std::atomic<bool> handlerTriggered{false};
 int globalOutputFd{-1};  // Global file descriptor for single output file
 std::mutex fileMutex;    // Mutex to protect file writes
-bool verboseFrameInfo = false;  // Global flag for verbose frame number logging
+int verboseFrameInfo = 0;  // Verbose frame logging: 0=off, 1=continuous, 2=first 100 frames then exit
+std::atomic<uint64_t> framesReceivedCount{0};  // Counter for verbose mode 2
 
 // Note: Frame builder is always used when ENABLE_FRAME_BUILDER is defined
 
@@ -636,12 +637,22 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
         // ====================================================================
         // VERBOSE LOGGING: Print frame information if requested
         // ====================================================================
-        if (verboseFrameInfo) {
+        if (verboseFrameInfo >= 1) {
             std::cout << "[FRAME] FrameNum=" << std::setw(8) << frameNumber
                       << " | Timestamp=" << std::setw(16) << timestamp
                       << " | ROC_ID=" << std::setw(4) << rocId
                       << " | Size=" << std::setw(8) << eventSize << " bytes"
                       << std::endl;
+
+            // Mode 2: Print first 100 frames then exit
+            if (verboseFrameInfo == 2) {
+                framesReceivedCount++;
+                if (framesReceivedCount >= 100) {
+                    std::cout << "\n=== Printed first 100 frames, exiting as requested ===" << std::endl;
+                    threadsRunning = false;  // Trigger clean shutdown
+                    break;  // Exit the reception loop
+                }
+            }
         }
 
         // ====================================================================
@@ -889,9 +900,9 @@ int main(int argc, char **argv)
     opts("expected-streams", po::value<int>(&expectedStreams)->default_value(1),
          "number of expected data streams per frame number - frame builds immediately when all "
          "streams arrive, or after timeout if incomplete (default: 1)");
-    opts("verbose-frames", po::value<bool>(&verboseFrameInfo)->default_value(false),
-         "print detailed frame information for every received frame: frame number, timestamp, "
-         "ROC ID, and payload size - useful for debugging stream synchronization (default: false)");
+    opts("verbose-frames", po::value<int>(&verboseFrameInfo)->default_value(0),
+         "verbose frame logging mode: 0=off, 1=print all frames continuously, "
+         "2=print first 100 frames then exit (for debugging stream alignment) (default: 0)");
 
     // Performance parameters
     opts("threads,t", po::value<size_t>(&numThreads)->default_value(1), 
