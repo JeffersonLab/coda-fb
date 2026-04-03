@@ -72,12 +72,12 @@ private:
     std::atomic<uint64_t> framesBuilt{0};
     std::atomic<uint64_t> slicesAggregated{0};
     std::atomic<uint64_t> buildErrors{0};
-    std::atomic<uint64_t> timestampErrors{0};
+    std::atomic<uint64_t> frameNumberErrors{0};
     std::atomic<uint64_t> filesCreated{0};
     std::atomic<uint64_t> bytesWritten{0};
 
     // Configuration
-    int timestampSlop;     // Max allowed timestamp difference for validation (NOT aggregation)
+    int frameNumberSlop;   // Max allowed frame number difference for validation (after correction)
     int frameTimeoutMs;    // How long to wait for all expected streams before partial build
     int expectedStreams;   // Number of expected data streams per frame number
 
@@ -97,9 +97,10 @@ public:
      * @param filePrefix Prefix for output file names (default: "frames")
      * @param numBuilderThreads Number of parallel builder threads (default: 4)
      * @param eventSize Maximum ET event size in bytes (default: 1MB)
-     * @param tsSlop Maximum timestamp difference (in ticks) for validation within a frame.
-     *               Used for data quality checking only - does NOT affect aggregation.
-     *               Frames are aggregated by exact frame number match (default: 100)
+     * @param fnSlop Maximum frame number difference for validation within a frame.
+     *               After per-stream correction factors are applied at startup,
+     *               this validates that corrected event numbers are within slop range.
+     *               Used for data quality checking only (default: 0)
      * @param timeout Frame timeout in milliseconds - how long to wait for all expected
      *                streams before building a partial frame (default: 1000)
      * @param expectedStreams Number of expected data streams per frame number
@@ -116,7 +117,7 @@ public:
                  const std::string& filePrefix = "frames",
                  int numBuilderThreads = 4,
                  int eventSize = 1024*1024,
-                 int tsSlop = 100,
+                 int fnSlop = 0,
                  int timeout = 1000,
                  int expectedStreams = 1);
 

@@ -902,10 +902,10 @@ int main(int argc, char **argv)
          "number of parallel frame builder threads (default: 1)");
 
     // Frame building options
-    opts("timestamp-slop", po::value<int>(&timestampSlop)->default_value(100),
-         "maximum timestamp difference (in ticks) allowed between streams within the same frame number - "
-         "used for data quality validation only, NOT for aggregation. "
-         "Frames are aggregated by exact frame number match (default: 100)");
+    opts("framenumber-slop", po::value<int>(&timestampSlop)->default_value(0),
+         "maximum frame number difference allowed between corrected event numbers within the same frame - "
+         "used for data quality validation only. After startup correction factors are applied, "
+         "this checks if corrected event numbers are within slop range (default: 0)");
     opts("frame-timeout", po::value<int>(&frameTimeout)->default_value(1000),
          "frame building timeout in milliseconds - how long to wait for all expected streams "
          "before building a partial frame (default: 1000)");

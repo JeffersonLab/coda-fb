@@ -2,46 +2,56 @@
  * E2SAR Reassembler Frame Builder - Multi-threaded Implementation
  *
  * This module extends the E2SAR receiver to aggregate multiple reassembled
- * data streams with the same frame number into a single EVIO-6 formatted
+ * data streams with the same event number into a single EVIO-6 formatted
  * Time Frame Bank and sends the result to an ET system.
  *
- * ALIGNMENT-BASED AGGREGATION STRATEGY:
- * =====================================
+ * EVENT-NUMBER-BASED AGGREGATION STRATEGY:
+ * =========================================
  * After reassembly, each input stream places its reassembled frames into its
  * own stream-dedicated FIFO queue. The frame-building thread reads frames from
- * these per-stream FIFOs, verifies that frame numbers are aligned across streams,
- * and builds aggregated frames only when alignment is maintained.
+ * these per-stream FIFOs using EVENT NUMBERS (from the reassembler) rather than
+ * timestamps or payload-embedded frame numbers.
+ *
+ * STARTUP CORRECTION FACTORS:
+ * At the beginning of a run, if event numbers from different streams are not
+ * aligned, constant per-stream correction factors are computed to align all
+ * streams to the minimum observed event number. These correction factors remain
+ * fixed for the entire run.
  *
  * ALGORITHM:
- * 1. Each stream has its own FIFO queue of reassembled frames
- * 2. Builder thread finds minimum frame number across all non-empty FIFOs
- * 3. Checks if ALL streams are aligned (all have same frame number at head)
- * 4. If ALIGNED:
- *    - Consume from all FIFOs with this frame number
+ * 1. STARTUP: Wait for first frame from each expected stream
+ * 2. STARTUP: Compute per-stream correction factors (offset = minEventNum - streamEventNum)
+ * 3. Each stream has its own FIFO queue of reassembled frames
+ * 4. Builder thread finds minimum CORRECTED event number across all non-empty FIFOs
+ * 5. Checks if ALL streams are aligned (all have same corrected event number at head)
+ * 6. If ALIGNED:
+ *    - Consume from all FIFOs with this corrected event number
  *    - Build complete aggregated frame
  *    - Send to ET/file output
- * 5. If NOT ALIGNED:
- *    - Consume ONLY from FIFOs with the minimum frame number (lagging streams)
+ * 7. If NOT ALIGNED:
+ *    - Consume ONLY from FIFOs with the minimum corrected event number (lagging streams)
  *    - Build partial frame for the lagging streams
  *    - Continue advancing only the lagging streams until alignment is restored
- * 6. After alignment is restored, resume reading from all FIFOs normally
+ * 8. After alignment is restored, resume reading from all FIFOs normally
  *
  * KEY BEHAVIORS:
- * - Never consume from a FIFO that already has a larger frame number
- * - Always advance only the streams with smaller frame numbers
- * - Only build complete frames when all streams show the same frame number
+ * - Per-stream correction factors are computed once at startup and remain constant
+ * - Never consume from a FIFO that already has a larger corrected event number
+ * - Always advance only the streams with smaller corrected event numbers
+ * - Only build complete frames when all streams show the same corrected event number
  * - Timeout handling: Force build after timeout even if not all streams present
+ * - Frame number slop validates data quality (default 0 = exact match required)
  *
  * SYNCHRONIZATION & THREAD SAFETY:
  * - Stream FIFOs are protected by mutex
  * - Condition variable wakes builder thread when new data arrives
  * - Lock released during expensive build/send operations
- * - Frame number distribution ensures same frame goes to same builder thread
+ * - Event number distribution ensures same event goes to same builder thread
  *
  * Multi-threaded design based on EMU PAGG (Primary Aggregator):
  * - Multiple parallel builder threads for high throughput
- * - Lock-free frame distribution across threads by frame number hash
- * - Each builder thread handles frames hashed to it by frame number
+ * - Lock-free frame distribution across threads by event number hash
+ * - Each builder thread handles frames hashed to it by event number
  * - Parallel EVIO-6 bank construction and ET publishing
  *
  * Copyright (c) 2024, Jefferson Science Associates
@@ -172,6 +182,14 @@ private:
     // Track first arrival time for each frame number (for timeout handling)
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> frameArrivalTimes;
 
+    // PER-STREAM EVENT NUMBER CORRECTION FACTORS:
+    // At startup, if streams have misaligned event numbers, we compute a constant
+    // correction factor for each stream to align them to the minimum observed event number.
+    // These corrections remain fixed for the entire run.
+    std::unordered_map<uint16_t, int64_t> streamEventNumCorrections;  // streamId -> offset
+    bool correctionFactorsInitialized{false};
+    uint32_t minInitialEventNum{UINT32_MAX};  // Lowest event number seen at startup
+
     std::mutex frameMutex;
     std::condition_variable frameCV;
 
@@ -180,7 +198,7 @@ private:
     std::atomic<bool> running{false};
 
     // Configuration
-    int timestampSlop;         // Max allowed timestamp difference for validation (NOT aggregation)
+    int frameNumberSlop;       // Max allowed frame number difference for validation (after correction)
     int frameTimeoutMs;        // How long to wait for all expected streams before partial build
     int etEventSize;
     int expectedStreamCount;   // Number of expected data streams per frame number
@@ -189,13 +207,13 @@ private:
     uint64_t framesBuilt{0};
     uint64_t slicesProcessed{0};
     uint64_t buildErrors{0};
-    uint64_t timestampErrors{0};
+    uint64_t frameNumberErrors{0};
     uint64_t filesCreated{0};
     uint64_t bytesWritten{0};
 
 public:
     BuilderThread(int index, int count, et_sys_id sys, et_att_id att,
-                  int tsSlop, int timeout, int evtSize,
+                  int fnSlop, int timeout, int evtSize,
                   bool enableET, bool enableFile,
                   const std::string& fileDir, const std::string& filePrefix,
                   int numExpectedStreams)
@@ -210,7 +228,7 @@ public:
         , currentFileSize(0)
         , maxFileSize(2ULL * 1024 * 1024 * 1024)  // 2GB
         , currentFileNumber(0)
-        , timestampSlop(tsSlop)
+        , frameNumberSlop(fnSlop)
         , frameTimeoutMs(timeout)
         , etEventSize(evtSize)
         , expectedStreamCount(numExpectedStreams)
@@ -370,20 +388,27 @@ public:
     /**
      * Add a time slice to this builder's per-stream FIFO
      *
-     * ALIGNMENT-BASED AGGREGATION:
+     * EVENT-NUMBER-BASED AGGREGATION:
      * - Each stream has its own FIFO queue
      * - Slices are enqueued to their stream's FIFO
-     * - Builder thread will check alignment and consume only when aligned
+     * - Builder thread will check alignment using corrected event numbers
+     * - Timeout tracking uses corrected event numbers (after startup)
      */
     void addTimeSlice(TimeSlice&& slice) {
         std::lock_guard<std::mutex> lock(frameMutex);
 
         uint16_t streamId = slice.dataId;
-        uint32_t frameNum = slice.frameNumber;
+        uint32_t rawEventNum = slice.frameNumber;
 
-        // Track first arrival time for this frame number (for timeout)
-        if (frameArrivalTimes.find(frameNum) == frameArrivalTimes.end()) {
-            frameArrivalTimes[frameNum] = std::chrono::steady_clock::now();
+        // Compute corrected event number for timeout tracking
+        // During startup before corrections are initialized, use raw event number
+        uint32_t trackingEventNum = correctionFactorsInitialized ?
+                                    getCorrectedEventNum(streamId, rawEventNum) :
+                                    rawEventNum;
+
+        // Track first arrival time for this corrected event number (for timeout)
+        if (frameArrivalTimes.find(trackingEventNum) == frameArrivalTimes.end()) {
+            frameArrivalTimes[trackingEventNum] = std::chrono::steady_clock::now();
         }
 
         // Enqueue slice to its stream's FIFO
@@ -406,8 +431,8 @@ public:
         // - Words 9+: ROC bank data (to be extracted)
 
         int sliceCount = frame.slices.size();
-        bool hasError = checkTimestampConsistency(frame);
-        if (hasError) timestampErrors++;
+        bool hasError = checkFrameNumberConsistency(frame);
+        if (hasError) frameNumberErrors++;
 
         // Calculate timestamp average
         uint64_t tsAvg = calculateAverageTimestamp(frame);
@@ -609,33 +634,34 @@ public:
     }
 
     /**
-     * Check timestamp consistency across slices
+     * Check frame number consistency across slices
      *
      * DATA QUALITY VALIDATION (not aggregation):
-     * All slices in this frame were aggregated by frame number (exact match).
-     * This function validates that their timestamps are also reasonably close,
-     * as a sanity check on data quality.
+     * All slices in this frame were aggregated by corrected event number (exact match).
+     * This function validates that all corrected event numbers are within the slop range
+     * of the frame's corrected event number, as a sanity check on data quality.
      *
-     * @return true if timestamps are inconsistent (exceeds slop), false if OK
+     * @return true if frame numbers are inconsistent (exceeds slop), false if OK
      */
-    bool checkTimestampConsistency(const AggregatedFrame& frame) const {
+    bool checkFrameNumberConsistency(const AggregatedFrame& frame) const {
         if (frame.slices.empty()) return false;
+        if (frameNumberSlop <= 0) return false;  // Slop of 0 means no checking
 
-        uint64_t tsMin = frame.slices[0].timestamp;
-        uint64_t tsMax = frame.slices[0].timestamp;
+        uint32_t targetCorrectedEventNum = frame.frameNumber;  // This is the corrected event number
 
         for (const auto& slice : frame.slices) {
-            tsMin = std::min(tsMin, slice.timestamp);
-            tsMax = std::max(tsMax, slice.timestamp);
-        }
+            uint32_t rawEventNum = slice.frameNumber;
+            uint32_t correctedEventNum = const_cast<BuilderThread*>(this)->getCorrectedEventNum(slice.dataId, rawEventNum);
 
-        if (tsMax - tsMin > static_cast<uint64_t>(timestampSlop)) {
-            std::cerr << "[" << threadName << "] WARNING: Timestamp inconsistency in frame "
-                      << frame.frameNumber << "! "
-                      << "Max=" << tsMax << ", Min=" << tsMin
-                      << ", Diff=" << (tsMax - tsMin)
-                      << ", Allowed=" << timestampSlop << std::endl;
-            return true;  // Error detected
+            int64_t diff = std::abs(static_cast<int64_t>(correctedEventNum) - static_cast<int64_t>(targetCorrectedEventNum));
+            if (diff > frameNumberSlop) {
+                std::cerr << "[" << threadName << "] WARNING: Frame number inconsistency in corrected event "
+                          << targetCorrectedEventNum << "! "
+                          << "Stream " << slice.dataId << " has correctedEventNum=" << correctedEventNum
+                          << ", Diff=" << diff
+                          << ", Allowed=" << frameNumberSlop << std::endl;
+                return true;  // Error detected
+            }
         }
 
         return false;
@@ -710,8 +736,10 @@ public:
     }
 
     /**
-     * Get the minimum frame number across all non-empty stream FIFOs
-     * Returns {found, minFrameNumber}
+     * Get the minimum CORRECTED event number across all non-empty stream FIFOs
+     * Returns {found, minCorrectedEventNum}
+     *
+     * Uses correction factors to align event numbers from different streams.
      */
     std::pair<bool, uint32_t> getMinimumFrameNumber() {
         // NOTE: Caller must hold frameMutex
@@ -720,7 +748,9 @@ public:
 
         for (const auto& [streamId, fifo] : streamFIFOs) {
             if (!fifo.empty()) {
-                minFrame = std::min(minFrame, fifo.front().frameNumber);
+                uint32_t rawEventNum = fifo.front().frameNumber;
+                uint32_t correctedEventNum = getCorrectedEventNum(streamId, rawEventNum);
+                minFrame = std::min(minFrame, correctedEventNum);
                 found = true;
             }
         }
@@ -729,20 +759,25 @@ public:
     }
 
     /**
-     * Check if all non-empty stream FIFOs are aligned on the given frame number
-     * Returns: {aligned, list of stream IDs that have this frame number}
+     * Check if all non-empty stream FIFOs are aligned on the given CORRECTED event number
+     * Returns: {aligned, list of stream IDs that have this corrected event number}
+     *
+     * Uses correction factors to compare event numbers after alignment.
      */
-    std::pair<bool, std::vector<uint16_t>> checkAlignment(uint32_t frameNumber) {
+    std::pair<bool, std::vector<uint16_t>> checkAlignment(uint32_t correctedEventNum) {
         // NOTE: Caller must hold frameMutex
         std::vector<uint16_t> alignedStreams;
         bool allAligned = true;
 
         for (const auto& [streamId, fifo] : streamFIFOs) {
             if (!fifo.empty()) {
-                if (fifo.front().frameNumber == frameNumber) {
+                uint32_t rawEventNum = fifo.front().frameNumber;
+                uint32_t streamCorrectedEventNum = getCorrectedEventNum(streamId, rawEventNum);
+
+                if (streamCorrectedEventNum == correctedEventNum) {
                     alignedStreams.push_back(streamId);
                 } else {
-                    // Found a stream with different frame number
+                    // Found a stream with different corrected event number
                     allAligned = false;
                 }
             }
@@ -764,6 +799,81 @@ public:
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second);
         return elapsed.count() > frameTimeoutMs;
+    }
+
+    /**
+     * Compute per-stream event number correction factors at startup
+     *
+     * STARTUP CORRECTION ALGORITHM:
+     * 1. Wait until we have at least one frame from each expected stream
+     * 2. Find the minimum event number across all streams
+     * 3. Compute correction offset for each stream = (minEventNum - streamEventNum)
+     * 4. These offsets remain constant for the entire run
+     *
+     * This ensures all streams are aligned to the same event number sequence.
+     * NOTE: Caller must hold frameMutex
+     */
+    void computeInitialCorrections() {
+        // Check if we have data from all expected streams
+        if (streamFIFOs.size() < static_cast<size_t>(expectedStreamCount)) {
+            // Not enough streams yet, wait for more data
+            return;
+        }
+
+        // Make sure all streams have at least one frame
+        for (const auto& [streamId, fifo] : streamFIFOs) {
+            if (fifo.empty()) {
+                return;  // Still waiting for data from this stream
+            }
+        }
+
+        // Find the minimum event number across all streams
+        minInitialEventNum = UINT32_MAX;
+        for (const auto& [streamId, fifo] : streamFIFOs) {
+            if (!fifo.empty()) {
+                uint32_t streamEventNum = fifo.front().frameNumber;
+                minInitialEventNum = std::min(minInitialEventNum, streamEventNum);
+            }
+        }
+
+        // Compute correction factor for each stream
+        std::cout << "[" << threadName << "] Computing initial event number correction factors:" << std::endl;
+        std::cout << "[" << threadName << "] Minimum initial event number: " << minInitialEventNum << std::endl;
+
+        for (const auto& [streamId, fifo] : streamFIFOs) {
+            if (!fifo.empty()) {
+                uint32_t streamEventNum = fifo.front().frameNumber;
+                int64_t correction = static_cast<int64_t>(minInitialEventNum) - static_cast<int64_t>(streamEventNum);
+                streamEventNumCorrections[streamId] = correction;
+
+                std::cout << "[" << threadName << "]   Stream " << streamId
+                          << ": Raw EventNum=" << streamEventNum
+                          << ", Correction=" << (correction >= 0 ? "+" : "") << correction
+                          << ", Corrected=" << (streamEventNum + correction) << std::endl;
+            }
+        }
+
+        correctionFactorsInitialized = true;
+        std::cout << "[" << threadName << "] Correction factors initialized (fixed for this run)" << std::endl;
+    }
+
+    /**
+     * Get corrected event number for a stream
+     *
+     * Applies the per-stream correction factor computed at startup.
+     * If stream has no correction (new stream after startup), defaults to 0 offset.
+     *
+     * @param streamId  Stream identifier
+     * @param rawEventNum  Raw event number from reassembler
+     * @return Corrected event number
+     */
+    uint32_t getCorrectedEventNum(uint16_t streamId, uint32_t rawEventNum) {
+        auto it = streamEventNumCorrections.find(streamId);
+        if (it != streamEventNumCorrections.end()) {
+            return rawEventNum + it->second;
+        }
+        // New stream not seen at startup - no correction
+        return rawEventNum;
     }
 
     /**
@@ -796,19 +906,32 @@ public:
             }
 
             // ================================================================
-            // ALIGNMENT-BASED FRAME BUILDING ALGORITHM
+            // STARTUP: COMPUTE CORRECTION FACTORS (ONCE)
+            // ================================================================
+            // On first frames from all streams, compute per-stream event number
+            // correction factors to align them. These remain constant for the run.
+            if (!correctionFactorsInitialized) {
+                computeInitialCorrections();
+                if (!correctionFactorsInitialized) {
+                    // Still waiting for all streams to send first frame
+                    continue;
+                }
+            }
+
+            // ================================================================
+            // ALIGNMENT-BASED FRAME BUILDING ALGORITHM (using corrected event numbers)
             // ================================================================
 
-            // Step 1: Find minimum frame number across all non-empty FIFOs
-            auto [hasData, minFrameNumber] = getMinimumFrameNumber();
+            // Step 1: Find minimum CORRECTED event number across all non-empty FIFOs
+            auto [hasData, minCorrectedEventNum] = getMinimumFrameNumber();
 
             if (!hasData) {
                 // No data available, wait for more
                 continue;
             }
 
-            // Step 2: Check alignment - which streams have this minimum frame number?
-            auto [allAligned, streamsWithMinFrame] = checkAlignment(minFrameNumber);
+            // Step 2: Check alignment - which streams have this minimum corrected event number?
+            auto [allAligned, streamsWithMinFrame] = checkAlignment(minCorrectedEventNum);
 
             if (streamsWithMinFrame.empty()) {
                 // Should never happen, but handle gracefully
@@ -818,7 +941,7 @@ public:
             // Step 3: Determine if we should build a frame
             bool shouldBuild = false;
             bool isComplete = false;
-            bool isTimeout = hasFrameTimedOut(minFrameNumber);
+            bool isTimeout = hasFrameTimedOut(minCorrectedEventNum);
 
             if (allAligned && streamsWithMinFrame.size() >= static_cast<size_t>(expectedStreamCount)) {
                 // CASE 1: All streams aligned AND all expected streams present
@@ -829,7 +952,7 @@ public:
                 shouldBuild = true;
                 isComplete = false;
             } else if (!allAligned) {
-                // CASE 3: NOT aligned - advance only the lagging streams (with min frame number)
+                // CASE 3: NOT aligned - advance only the lagging streams (with min corrected event number)
                 shouldBuild = true;
                 isComplete = false;
             }
@@ -840,41 +963,46 @@ public:
             }
 
             // Step 4: Consume slices from appropriate streams
-            // - If aligned: consume from ALL streams with this frame number
-            // - If NOT aligned: consume ONLY from streams with minimum frame number (lagging streams)
+            // - If aligned: consume from ALL streams with this corrected event number
+            // - If NOT aligned: consume ONLY from streams with minimum corrected event number (lagging streams)
             AggregatedFrame aggregatedFrame;
-            aggregatedFrame.frameNumber = minFrameNumber;
+            aggregatedFrame.frameNumber = minCorrectedEventNum;  // Use corrected event number
             aggregatedFrame.timestamp = 0;  // Will calculate average
 
             for (uint16_t streamId : streamsWithMinFrame) {
                 auto& fifo = streamFIFOs[streamId];
-                if (!fifo.empty() && fifo.front().frameNumber == minFrameNumber) {
-                    // Pop slice from this stream's FIFO
-                    TimeSlice slice = std::move(fifo.front());
-                    fifo.pop();
-                    aggregatedFrame.addSlice(std::move(slice));
+                if (!fifo.empty()) {
+                    uint32_t rawEventNum = fifo.front().frameNumber;
+                    uint32_t correctedEventNum = getCorrectedEventNum(streamId, rawEventNum);
+
+                    if (correctedEventNum == minCorrectedEventNum) {
+                        // Pop slice from this stream's FIFO
+                        TimeSlice slice = std::move(fifo.front());
+                        fifo.pop();
+                        aggregatedFrame.addSlice(std::move(slice));
+                    }
                 }
             }
 
-            // Clean up timeout tracking for this frame number if all streams consumed it
+            // Clean up timeout tracking for this corrected event number if all streams consumed it
             if (allAligned) {
-                frameArrivalTimes.erase(minFrameNumber);
+                frameArrivalTimes.erase(minCorrectedEventNum);
             }
 
             // Release lock before expensive build/send operations
             lock.unlock();
 
-            // Step 5: Log what we're doing
+            // Step 5: Log what we're doing (using corrected event number)
             if (allAligned && isComplete) {
-                std::cout << "[" << threadName << "] Frame " << minFrameNumber
+                std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
                           << ": ALIGNED & COMPLETE (" << aggregatedFrame.slices.size()
                           << "/" << expectedStreamCount << " streams)" << std::endl;
             } else if (allAligned && !isComplete) {
-                std::cout << "[" << threadName << "] Frame " << minFrameNumber
+                std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
                           << ": ALIGNED but PARTIAL (" << aggregatedFrame.slices.size()
                           << "/" << expectedStreamCount << " streams) - TIMEOUT" << std::endl;
             } else {
-                std::cout << "[" << threadName << "] Frame " << minFrameNumber
+                std::cout << "[" << threadName << "] CorrectedEventNum " << minCorrectedEventNum
                           << ": NOT ALIGNED - advancing " << aggregatedFrame.slices.size()
                           << " lagging stream(s)" << std::endl;
             }
@@ -983,12 +1111,12 @@ public:
     /**
      * Get statistics
      */
-    void getStats(uint64_t& built, uint64_t& slices, uint64_t& errors, uint64_t& tsErrors,
+    void getStats(uint64_t& built, uint64_t& slices, uint64_t& errors, uint64_t& fnErrors,
                   uint64_t& files, uint64_t& bytes) const {
         built = framesBuilt;
         slices = slicesProcessed;
         errors = buildErrors;
-        tsErrors = timestampErrors;
+        fnErrors = frameNumberErrors;
         files = filesCreated;
         bytes = bytesWritten;
     }
@@ -1006,7 +1134,7 @@ FrameBuilder::FrameBuilder(const std::string& etFile,
              const std::string& filePrefix,
              int numBuilderThreads,
              int eventSize,
-             int tsSlop,
+             int fnSlop,
              int timeout,
              int numExpectedStreams)
     : etSystemFile(etFile)
@@ -1018,7 +1146,7 @@ FrameBuilder::FrameBuilder(const std::string& etFile,
     , fileOutputDir(fileDir)
     , fileOutputPrefix(filePrefix)
     , builderThreadCount(numBuilderThreads)
-    , timestampSlop(tsSlop)
+    , frameNumberSlop(fnSlop)
     , frameTimeoutMs(timeout)
     , expectedStreams(numExpectedStreams)
 {
@@ -1234,7 +1362,7 @@ bool FrameBuilder::start() {
             builderThreadCount,
             etSystem,
             attachment,
-            timestampSlop,
+            frameNumberSlop,
             frameTimeoutMs,
             etEventSize,
             enableET,
@@ -1275,18 +1403,18 @@ void FrameBuilder::stop() {
     // Collect statistics from all threads
     framesBuilt = 0;
     buildErrors = 0;
-    timestampErrors = 0;
+    frameNumberErrors = 0;
     filesCreated = 0;
     bytesWritten = 0;
 
     std::cout << "Collecting statistics..." << std::endl;
 
     for (auto& builder : builderThreads) {
-        uint64_t built, slices, errors, tsErrors, files, bytes;
-        builder->getStats(built, slices, errors, tsErrors, files, bytes);
+        uint64_t built, slices, errors, fnErrors, files, bytes;
+        builder->getStats(built, slices, errors, fnErrors, files, bytes);
         framesBuilt += built;
         buildErrors += errors;
-        timestampErrors += tsErrors;
+        frameNumberErrors += fnErrors;
         filesCreated += files;
         bytesWritten += bytes;
     }
@@ -1324,7 +1452,7 @@ void FrameBuilder::printStatistics() const {
     std::cout << "  Frames Built: " << framesBuilt << std::endl;
     std::cout << "  Slices Aggregated: " << slicesAggregated << std::endl;
     std::cout << "  Build Errors: " << buildErrors << std::endl;
-    std::cout << "  Timestamp Errors: " << timestampErrors << std::endl;
+    std::cout << "  Frame Number Errors: " << frameNumberErrors << std::endl;
     if (slicesAggregated > 0 && framesBuilt > 0) {
         std::cout << "  Avg Slices/Frame: "
                   << (static_cast<double>(slicesAggregated) / framesBuilt)
