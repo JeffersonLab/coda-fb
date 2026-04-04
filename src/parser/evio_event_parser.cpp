@@ -221,7 +221,15 @@ private:
 
         size_t numWords = payloadBytes / 4;
 
+        if (fadcVerbose) {
+            std::cout << "# DEBUG: decodeFADC250Payload crate=" << rocId << " slot=" << slotId
+                     << " bytes=" << payloadBytes << " words=" << numWords << "\n";
+        }
+
         if (numWords == 0) {
+            if (fadcVerbose) {
+                std::cout << "# DEBUG: No words to decode (empty payload)\n";
+            }
             return hits;
         }
 
@@ -644,6 +652,11 @@ public:
         int rocId = (rocIndex < currentEventROCIds.size()) ? currentEventROCIds[rocIndex] : rocIndex;
 
         // Check if this is a BANK (0x10) containing sub-banks, or direct data
+        if (fadcVerbose) {
+            std::cout << "# DEBUG: ROC " << rocId << " type=0x" << std::hex << (int)type << std::dec
+                     << " tag=" << tag << " length=" << bankLength << "\n";
+        }
+
         if (type == 0x10) {
             // ROC bank contains sub-banks (one per FADC slot)
             // bankLength is exclusive, so actual data is (bankLength - 1) words
@@ -709,13 +722,18 @@ public:
                     );
 
                     // Print hits if FADC verbose enabled (one line per hit)
-                    if (fadcVerbose && !hits.empty()) {
-                        for (const auto& hit : hits) {
-                            std::cout << hit.crate << " "
-                                     << hit.slot << " "
-                                     << hit.channel << " "
-                                     << hit.charge << " "
-                                     << hit.time << "\n";
+                    if (fadcVerbose) {
+                        if (hits.empty()) {
+                            std::cout << "# DEBUG: No hits decoded from slot " << slotId
+                                     << " (" << payloadBytes << " bytes)\n";
+                        } else {
+                            for (const auto& hit : hits) {
+                                std::cout << "crate=" << hit.crate
+                                         << ", slot=" << hit.slot
+                                         << ", channel=" << hit.channel
+                                         << ", charge=" << hit.charge
+                                         << ", time=" << hit.time << "\n";
+                            }
                         }
                     }
 
@@ -770,6 +788,10 @@ public:
         currentEventHits.clear();
         currentEventROCIds.clear();
 
+        if (fadcVerbose) {
+            std::cout << "# DEBUG: parseEvent() called at position " << currentPos << "\n";
+        }
+
         // Parse aggregated frame structure
         parseAggregatedFrameBank();
         parseStreamInfoBank();
@@ -792,11 +814,19 @@ public:
         parseAggregationInfoSegment();
 
         // Parse ROC payload banks
+        if (fadcVerbose) {
+            std::cout << "# DEBUG: Parsing " << rocCount << " ROC banks\n";
+        }
+
         for (int i = 0; i < rocCount && currentPos < fileData.size(); i++) {
             parseROCPayloadBank(i);
         }
 
         // Event hits already printed during parsing (one line per hit)
+        if (fadcVerbose) {
+            std::cout << "# DEBUG: Event complete, total hits in currentEventHits: "
+                     << currentEventHits.size() << "\n";
+        }
     }
 
     void parse() {
