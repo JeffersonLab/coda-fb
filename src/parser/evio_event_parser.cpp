@@ -235,24 +235,45 @@ private:
         bool hasBlockHeader = (blockHeader & 0x80000000) != 0;  // Bit 31 = 1
         uint8_t dataType = (blockHeader >> 27) & 0x0F;          // Bits 27-30
 
-        if (hasBlockHeader && dataType == 0x0) {
+        // Debug: Always show first word analysis when FADC verbose enabled
+        if (fadcVerbose) {
+            printIndent(4);
+            std::cout << "[FADC250] First word: 0x" << std::hex << blockHeader << std::dec
+                     << " | Bit31=" << ((blockHeader & 0x80000000) ? "1" : "0")
+                     << " | DataType=0x" << std::hex << (int)dataType << std::dec
+                     << " | ExtractedSlot=" << ((blockHeader >> 22) & 0x1F)
+                     << " | FallbackSlot=" << slotIdFallback << "\n";
+        }
+
+        // FADC250 block headers typically have bit 31=1 and dataType=0x1
+        // Some formats may use dataType=0x0, so accept both
+        if (hasBlockHeader && (dataType == 0x0 || dataType == 0x1)) {
             // Valid block header found
             slotId = (blockHeader >> 22) & 0x1F;  // Bits 22-26 (5 bits)
             uint32_t blockNum = blockHeader & 0x3FFFFF;  // Bits 0-21
 
-            if (verbose) {
+            if (fadcVerbose) {
                 printIndent(4);
-                std::cout << "[FADC250 Block Header] Slot=" << slotId
-                         << " BlockNum=" << blockNum << "\n";
+                std::cout << "[FADC250 Block Header] VALID - Slot=" << slotId
+                         << " BlockNum=" << blockNum
+                         << " DataType=0x" << std::hex << (int)dataType << std::dec << "\n";
             }
 
             dataStartWord = 1;  // Skip block header, start decoding from word 1
         } else {
             // No valid block header, decode all words as hit data
-            if (verbose) {
+            if (fadcVerbose) {
                 printIndent(4);
-                std::cout << "[FADC250 Warning] No valid block header found, using fallback slot="
-                         << slotIdFallback << "\n";
+                std::cout << "[FADC250 Warning] NO VALID BLOCK HEADER - using fallback slot="
+                         << slotIdFallback << " (ROC ID)\n";
+                printIndent(4);
+                std::cout << "  Reason: ";
+                if (!hasBlockHeader) {
+                    std::cout << "Bit 31 not set (expected 1 for header)\n";
+                } else {
+                    std::cout << "DataType=0x" << std::hex << (int)dataType << std::dec
+                             << " (expected 0x0 or 0x1)\n";
+                }
             }
         }
 
