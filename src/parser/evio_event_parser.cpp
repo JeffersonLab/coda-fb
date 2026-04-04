@@ -235,7 +235,7 @@ private:
             // Skip words that look like headers (bit 31 = 1)
             // Though there shouldn't be any in this format
             if (word & 0x80000000) {
-                if (fadcVerbose) {
+                if (verbose) {
                     printIndent(5);
                     std::cout << "[FADC250] Skipping header word: 0x" << std::hex << word << std::dec << "\n";
                 }
@@ -625,8 +625,8 @@ public:
         printField("Type", type, "", 3);
         printField("Stream Status", streamStatus, "", 3);
 
-        // Debug: Show ROC bank type when FADC verbose enabled
-        if (fadcVerbose) {
+        // Debug: Show ROC bank type when verbose enabled
+        if (verbose) {
             printIndent(3);
             std::cout << "[ROC BANK] Tag=" << tag << " Type=0x" << std::hex << (int)type << std::dec;
             if (type == 0x10) {
@@ -650,7 +650,7 @@ public:
             size_t rocDataWords = bankLength - 1;
             size_t rocDataEndPos = currentPos + (rocDataWords * 4);
 
-            if (fadcVerbose) {
+            if (verbose) {
                 printIndent(3);
                 std::cout << "[ROC BANK] Parsing sub-banks (slots) within ROC " << rocId << "\n";
             }
@@ -674,7 +674,7 @@ public:
 
                 // Skip first sub-bank (Stream Info Bank, tag 0xFF30 or 0xFF31)
                 if (subBankIndex == 0) {
-                    if (fadcVerbose) {
+                    if (verbose) {
                         printIndent(4);
                         std::cout << "[STREAM INFO] Skipping first bank (Tag=0x" << std::hex << payloadTag << std::dec
                                  << ", Length=" << payloadBankLength << " words)\n";
@@ -687,7 +687,7 @@ public:
                 // This is a payload bank - tag IS the slot number!
                 int slotId = payloadTag;
 
-                if (fadcVerbose) {
+                if (verbose) {
                     printIndent(4);
                     std::cout << "[PAYLOAD BANK] Slot=" << slotId
                              << " (Tag=0x" << std::hex << payloadTag << std::dec
@@ -708,17 +708,14 @@ public:
                         payloadBytes
                     );
 
-                    // Print hits if FADC verbose enabled
+                    // Print hits if FADC verbose enabled (one line per hit)
                     if (fadcVerbose && !hits.empty()) {
-                        printIndent(4);
-                        std::cout << "  FADC250 Hits: " << hits.size() << " hits\n";
                         for (const auto& hit : hits) {
-                            printIndent(5);
-                            std::cout << "Crate=" << hit.crate
-                                     << " Slot=" << hit.slot
-                                     << " Chan=" << hit.channel
-                                     << " Charge=" << hit.charge
-                                     << " Time=" << hit.time << "ns\n";
+                            std::cout << hit.crate << " "
+                                     << hit.slot << " "
+                                     << hit.channel << " "
+                                     << hit.charge << " "
+                                     << hit.time << "\n";
                         }
                     }
 
@@ -750,16 +747,14 @@ public:
                 payloadBytes
             );
 
-            // Print hits if FADC verbose enabled
+            // Print hits if FADC verbose enabled (one line per hit)
             if (fadcVerbose && !hits.empty()) {
-                printHeader("FADC250 Hits (" + std::to_string(hits.size()) + " hits)", 3);
                 for (const auto& hit : hits) {
-                    printIndent(4);
-                    std::cout << "Crate=" << hit.crate
-                             << " Slot=" << hit.slot
-                             << " Chan=" << hit.channel
-                             << " Charge=" << hit.charge
-                             << " Time=" << hit.time << "ns\n";
+                    std::cout << hit.crate << " "
+                             << hit.slot << " "
+                             << hit.channel << " "
+                             << hit.charge << " "
+                             << hit.time << "\n";
                 }
             }
 
@@ -801,11 +796,7 @@ public:
             parseROCPayloadBank(i);
         }
 
-        // Print event summary
-        if (fadcVerbose && !currentEventHits.empty()) {
-            printHeader("Event FADC Summary: " + std::to_string(currentEventHits.size()) +
-                       " total hits", 1);
-        }
+        // Event hits already printed during parsing (one line per hit)
     }
 
     void parse() {
