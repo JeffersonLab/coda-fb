@@ -655,7 +655,10 @@ public:
                 std::cout << "[ROC BANK] Parsing sub-banks (slots) within ROC " << rocId << "\n";
             }
 
-            // Parse sub-banks (payload banks, one per slot)
+            // Skip first sub-bank (Stream Info Bank with tag 0xFF31 or 0xFF30)
+            // Then parse payload banks (one per FADC slot)
+            int subBankIndex = 0;
+
             while (currentPos < rocDataEndPos && currentPos < fileData.size()) {
                 // Read payload bank header
                 uint32_t payloadBankLength = read32();
@@ -665,26 +668,33 @@ public:
                 uint8_t payloadType = (payloadBankHeader >> 8) & 0xFF;
                 uint8_t payloadNum = payloadBankHeader & 0xFF;  // Bits 7-0
 
-                // Determine slot ID: use Num field if Tag is standard 0xFF30
-                int slotId;
-                if (payloadTag == 0xFF30) {
-                    slotId = payloadNum;  // Use Num field (bits 7-0)
-                } else {
-                    slotId = payloadTag;  // Use Tag field
+                // Payload data size (bankLength - 1 for the header we already read)
+                size_t payloadDataWords = (payloadBankLength > 1) ? (payloadBankLength - 1) : 0;
+                size_t payloadBytes = payloadDataWords * 4;
+
+                // Skip first sub-bank (Stream Info Bank, tag 0xFF30 or 0xFF31)
+                if (subBankIndex == 0) {
+                    if (fadcVerbose) {
+                        printIndent(4);
+                        std::cout << "[STREAM INFO] Skipping first bank (Tag=0x" << std::hex << payloadTag << std::dec
+                                 << ", Length=" << payloadBankLength << " words)\n";
+                    }
+                    currentPos += payloadBytes;
+                    subBankIndex++;
+                    continue;
                 }
+
+                // This is a payload bank - tag IS the slot number!
+                int slotId = payloadTag;
 
                 if (fadcVerbose) {
                     printIndent(4);
-                    std::cout << "[PAYLOAD BANK] Tag=0x" << std::hex << payloadTag << std::dec
-                             << " Num=" << (int)payloadNum
-                             << " Type=0x" << std::hex << (int)payloadType << std::dec
-                             << " → Slot=" << slotId
-                             << " Length=" << payloadBankLength << " words\n";
+                    std::cout << "[PAYLOAD BANK] Slot=" << slotId
+                             << " (Tag=0x" << std::hex << payloadTag << std::dec
+                             << ") Length=" << payloadBankLength << " words\n";
                 }
 
-                // Payload data (bankLength - 1 for the header we already read)
-                size_t payloadDataWords = (payloadBankLength > 1) ? (payloadBankLength - 1) : 0;
-                size_t payloadBytes = payloadDataWords * 4;
+                subBankIndex++;
 
                 if (payloadBytes > 0) {
                     const uint8_t* payloadData = &fileData[currentPos];
