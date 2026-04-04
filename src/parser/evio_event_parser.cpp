@@ -731,10 +731,12 @@ public:
                 size_t payloadBytes = payloadDataWords * 4;
 
                 if (fadcVerbose) {
+                    std::cout << "# DEBUG: Payload Port Length=" << payloadBankLength << " words\n";
                     std::cout << "# DEBUG: Payload bank header=0x" << std::hex << payloadBankHeader << std::dec
                              << " tag=0x" << std::hex << payloadTag << std::dec
                              << " type=0x" << std::hex << (int)payloadType << std::dec
                              << " num=" << (int)payloadNum
+                             << " payloadDataWords=" << payloadDataWords
                              << " payloadBytes=" << payloadBytes << "\n";
                 }
 
