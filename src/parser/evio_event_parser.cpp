@@ -708,9 +708,15 @@ public:
                              << " payloadBytes=" << payloadBytes << "\n";
                 }
 
-                // Treat all non-empty banks as potential payload banks
-                // Tag is the slot number (even if tag is 0xFF30)
-                int slotId = payloadTag;
+                // Determine slot ID:
+                // - If tag is 0xFF30 (standard payload tag), use Num field (bits 7-0)
+                // - Otherwise, use Tag field directly
+                int slotId;
+                if (payloadTag == 0xFF30) {
+                    slotId = payloadNum;  // Use Num field for standard payload banks
+                } else {
+                    slotId = payloadTag;  // Use Tag for custom banks
+                }
 
                 if (verbose) {
                     printIndent(4);
