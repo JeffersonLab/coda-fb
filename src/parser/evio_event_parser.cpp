@@ -663,6 +663,12 @@ public:
             size_t rocDataWords = bankLength - 1;
             size_t rocDataEndPos = currentPos + (rocDataWords * 4);
 
+            if (fadcVerbose) {
+                std::cout << "# DEBUG: ROC BANK type=0x10, rocDataWords=" << rocDataWords
+                         << " rocDataEndPos=" << rocDataEndPos
+                         << " currentPos=" << currentPos << "\n";
+            }
+
             if (verbose) {
                 printIndent(3);
                 std::cout << "[ROC BANK] Parsing sub-banks (slots) within ROC " << rocId << "\n";
@@ -672,7 +678,17 @@ public:
             // Then parse payload banks (one per FADC slot)
             int subBankIndex = 0;
 
+            if (fadcVerbose) {
+                std::cout << "# DEBUG: Entering sub-bank loop, condition: currentPos(" << currentPos
+                         << ") < rocDataEndPos(" << rocDataEndPos << ") = "
+                         << (currentPos < rocDataEndPos ? "true" : "false") << "\n";
+            }
+
             while (currentPos < rocDataEndPos && currentPos < fileData.size()) {
+                if (fadcVerbose) {
+                    std::cout << "# DEBUG: Sub-bank loop iteration " << subBankIndex
+                             << " at position " << currentPos << "\n";
+                }
                 // Read payload bank header
                 uint32_t payloadBankLength = read32();
                 uint32_t payloadBankHeader = read32();
@@ -685,8 +701,19 @@ public:
                 size_t payloadDataWords = (payloadBankLength > 1) ? (payloadBankLength - 1) : 0;
                 size_t payloadBytes = payloadDataWords * 4;
 
+                if (fadcVerbose) {
+                    std::cout << "# DEBUG: Read payload bank header: length=" << payloadBankLength
+                             << " tag=0x" << std::hex << payloadTag << std::dec
+                             << " type=0x" << std::hex << (int)payloadType << std::dec
+                             << " payloadBytes=" << payloadBytes << "\n";
+                }
+
                 // Skip first sub-bank (Stream Info Bank, tag 0xFF30 or 0xFF31)
                 if (subBankIndex == 0) {
+                    if (fadcVerbose) {
+                        std::cout << "# DEBUG: Skipping first sub-bank (SIB), tag=0x" << std::hex << payloadTag << std::dec
+                                 << " payloadBytes=" << payloadBytes << "\n";
+                    }
                     if (verbose) {
                         printIndent(4);
                         std::cout << "[STREAM INFO] Skipping first bank (Tag=0x" << std::hex << payloadTag << std::dec
@@ -694,6 +721,9 @@ public:
                     }
                     currentPos += payloadBytes;
                     subBankIndex++;
+                    if (fadcVerbose) {
+                        std::cout << "# DEBUG: After skipping SIB, currentPos=" << currentPos << "\n";
+                    }
                     continue;
                 }
 
@@ -710,6 +740,12 @@ public:
                 subBankIndex++;
 
                 if (payloadBytes > 0) {
+                    if (fadcVerbose) {
+                        std::cout << "# DEBUG: Decoding payload: rocId=" << rocId
+                                 << " slotId=" << slotId
+                                 << " payloadBytes=" << payloadBytes << "\n";
+                    }
+
                     const uint8_t* payloadData = &fileData[currentPos];
 
                     // Decode FADC250 hit data (no block header, just hit words)
@@ -741,7 +777,16 @@ public:
                     currentEventHits.insert(currentEventHits.end(), hits.begin(), hits.end());
 
                     currentPos += payloadBytes;
+                } else {
+                    if (fadcVerbose) {
+                        std::cout << "# DEBUG: Payload bytes is 0, skipping decode\n";
+                    }
                 }
+            }
+
+            if (fadcVerbose) {
+                std::cout << "# DEBUG: Exited sub-bank loop, currentPos=" << currentPos
+                         << " rocDataEndPos=" << rocDataEndPos << "\n";
             }
         } else {
             // ROC bank contains direct data (old format or single slot)
