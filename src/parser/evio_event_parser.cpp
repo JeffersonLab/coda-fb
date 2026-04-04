@@ -188,12 +188,25 @@ private:
     }
 
     std::vector<FADCHit> decodeFADC250Payload(
-        uint64_t frameTimestampNs,
+        uint64_t frameTimestampNs,  // IMPORTANT: Assumed to be in nanoseconds
         int rocId,
         int slotIdFallback,  // Fallback if block header not found
         const uint8_t* payloadData,
         size_t payloadBytes
     ) {
+        /**
+         * FADC250 Data Word Format (32 bits):
+         * Bit 31:    0 (data word identifier, 1=header)
+         * Bits 17-30: Time offset (14 bits, 0-16383, in 4ns bins)
+         * Bits 13-16: Channel number (4 bits, 0-15)
+         * Bits 0-12:  Integrated charge (13 bits, 0-8191)
+         *
+         * TIMESTAMP UNITS WARNING:
+         * This function assumes frameTimestampNs is in nanoseconds.
+         * If the frame timestamp is in different units (e.g., 4ns ticks from TI),
+         * the absolute hit times will be incorrect.
+         * TODO: Verify timestamp units from CODA payload specification.
+         */
         std::vector<FADCHit> hits;
 
         // Validate payload size is multiple of 4
@@ -255,18 +268,26 @@ private:
                 continue;  // Skip header words
             }
 
-            // Extract hit data fields
-            int charge = word & 0x1FFF;                        // Bits 0-12
-            int channel = (word >> 13) & 0x000F;               // Bits 13-16
-            uint64_t timeOffset = ((word >> 17) & 0x3FFF) * 4; // Bits 17-30, * 4ns
+            // Extract hit data fields (bit field extraction verified correct)
+            int charge = word & 0x1FFF;                        // Bits 0-12 (13 bits: 0-8191)
+            int channel = (word >> 13) & 0x000F;               // Bits 13-16 (4 bits: 0-15)
+            uint64_t timeOffset = ((word >> 17) & 0x3FFF) * 4; // Bits 17-30 (14 bits: 0-16383), * 4ns
 
             uint64_t hitTime = frameTimestampNs + timeOffset;
 
-            // Validation
+            // Validation: Channel must be 0-15 (FADC250 has 16 channels)
             if (channel > 15) {
-                result.addWarning("Invalid FADC250 channel: " + std::to_string(channel) +
-                                " in ROC " + std::to_string(rocId) + " slot " + std::to_string(slotId));
+                result.addWarning("Invalid FADC250 channel " + std::to_string(channel) +
+                                " (must be 0-15) in ROC " + std::to_string(rocId) +
+                                " slot " + std::to_string(slotId));
                 continue;
+            }
+
+            // Validation: Charge should fit in 13 bits (0-8191)
+            // This check is redundant due to mask, but kept for clarity
+            if (charge > 8191) {
+                result.addWarning("FADC250 charge overflow: " + std::to_string(charge) +
+                                " in ROC " + std::to_string(rocId) + " slot " + std::to_string(slotId));
             }
 
             hits.emplace_back(rocId, slotId, channel, charge, hitTime);
