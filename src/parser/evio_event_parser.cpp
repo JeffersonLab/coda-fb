@@ -674,8 +674,8 @@ public:
                 std::cout << "[ROC BANK] Parsing sub-banks (slots) within ROC " << rocId << "\n";
             }
 
-            // Skip first sub-bank (Stream Info Bank with tag 0xFF31 or 0xFF30)
-            // Then parse payload banks (one per FADC slot)
+            // Parse all sub-banks as potential payload banks
+            // Don't skip any - even tag 0xFF30 can contain FADC data
             int subBankIndex = 0;
 
             if (fadcVerbose) {
@@ -708,26 +708,8 @@ public:
                              << " payloadBytes=" << payloadBytes << "\n";
                 }
 
-                // Skip first sub-bank (Stream Info Bank, tag 0xFF30 or 0xFF31)
-                if (subBankIndex == 0) {
-                    if (fadcVerbose) {
-                        std::cout << "# DEBUG: Skipping first sub-bank (SIB), tag=0x" << std::hex << payloadTag << std::dec
-                                 << " payloadBytes=" << payloadBytes << "\n";
-                    }
-                    if (verbose) {
-                        printIndent(4);
-                        std::cout << "[STREAM INFO] Skipping first bank (Tag=0x" << std::hex << payloadTag << std::dec
-                                 << ", Length=" << payloadBankLength << " words)\n";
-                    }
-                    currentPos += payloadBytes;
-                    subBankIndex++;
-                    if (fadcVerbose) {
-                        std::cout << "# DEBUG: After skipping SIB, currentPos=" << currentPos << "\n";
-                    }
-                    continue;
-                }
-
-                // This is a payload bank - tag IS the slot number!
+                // Treat all non-empty banks as potential payload banks
+                // Tag is the slot number (even if tag is 0xFF30)
                 int slotId = payloadTag;
 
                 if (verbose) {
