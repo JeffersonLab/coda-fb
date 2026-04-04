@@ -726,18 +726,63 @@ public:
                 uint8_t payloadType = (payloadBankHeader >> 8) & 0xFF;
                 uint8_t payloadNum = payloadBankHeader & 0xFF;  // Bits 7-0
 
-                // Payload data size (bankLength - 1 for the header we already read)
-                size_t payloadDataWords = (payloadBankLength > 1) ? (payloadBankLength - 1) : 0;
-                size_t payloadBytes = payloadDataWords * 4;
+                // CRITICAL: Like Java's getRawBytes(), don't trust payloadBankLength
+                // (Java TODO: "check to see why payloadLength always returns 1")
+                // Instead, calculate payload size by looking ahead for next bank or ROC end
+
+                size_t dataStartPos = currentPos;
+                size_t payloadBytes = 0;
+
+                // Look ahead to find next payload bank header or end of ROC
+                size_t scanPos = currentPos;
+                bool foundNextBank = false;
+
+                while (scanPos + 8 <= rocDataEndPos) {
+                    // Peek at potential next bank header
+                    uint32_t peekLength = *reinterpret_cast<const uint32_t*>(&fileData[scanPos]);
+                    peekLength = __builtin_bswap32(peekLength);  // Convert from big-endian
+
+                    uint32_t peekHeader = *reinterpret_cast<const uint32_t*>(&fileData[scanPos + 4]);
+                    peekHeader = __builtin_bswap32(peekHeader);
+
+                    uint16_t peekTag = (peekHeader >> 16) & 0xFFFF;
+                    uint8_t peekType = (peekHeader >> 8) & 0xFF;
+
+                    // Check if this looks like a valid payload bank header
+                    // (tag = slot number, typically 1-20; type = 0x0)
+                    if (peekType == 0x0 && peekTag > 0 && peekTag <= 0x14) {
+                        // Found next payload bank
+                        payloadBytes = scanPos - dataStartPos;
+                        foundNextBank = true;
+                        if (fadcVerbose) {
+                            std::cout << "# DEBUG: Found next bank at offset " << (scanPos - dataStartPos)
+                                     << ", tag=0x" << std::hex << peekTag << std::dec << "\n";
+                        }
+                        break;
+                    }
+
+                    scanPos += 4;  // Advance by one word
+                }
+
+                if (!foundNextBank) {
+                    // No next bank found, data extends to end of ROC
+                    payloadBytes = rocDataEndPos - dataStartPos;
+                    if (fadcVerbose) {
+                        std::cout << "# DEBUG: No next bank found, using remaining ROC space: "
+                                 << payloadBytes << " bytes\n";
+                    }
+                }
+
+                size_t payloadDataWords = payloadBytes / 4;
 
                 if (fadcVerbose) {
-                    std::cout << "# DEBUG: Payload Port Length=" << payloadBankLength << " words\n";
+                    std::cout << "# DEBUG: Payload Port Length field=" << payloadBankLength << " words (unreliable)\n";
+                    std::cout << "# DEBUG: Calculated payload size=" << payloadBytes << " bytes ("
+                             << payloadDataWords << " words) via getRawBytes() approach\n";
                     std::cout << "# DEBUG: Payload bank header=0x" << std::hex << payloadBankHeader << std::dec
                              << " tag=0x" << std::hex << payloadTag << std::dec
                              << " type=0x" << std::hex << (int)payloadType << std::dec
-                             << " num=" << (int)payloadNum
-                             << " payloadDataWords=" << payloadDataWords
-                             << " payloadBytes=" << payloadBytes << "\n";
+                             << " num=" << (int)payloadNum << "\n";
                 }
 
                 // Slot number is the TAG of the payload bank (per page 21 of spec)
