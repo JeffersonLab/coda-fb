@@ -710,7 +710,20 @@ public:
 
             if (fadcVerbose) {
                 std::cout << "# DEBUG: Entering payload bank loop, currentPos=" << currentPos
-                         << " rocDataEndPos=" << rocDataEndPos << "\n";
+                         << " rocDataEndPos=" << rocDataEndPos
+                         << " remaining=" << (rocDataEndPos - currentPos) << " bytes\n";
+
+                // Hex dump of remaining ROC data
+                if (rocDataEndPos - currentPos > 0) {
+                    std::cout << "# DEBUG: Hex dump of remaining " << (rocDataEndPos - currentPos) << " bytes:\n";
+                    for (size_t i = currentPos; i < rocDataEndPos && i < currentPos + 64; i += 4) {
+                        if (i + 4 <= rocDataEndPos) {
+                            uint32_t word = *reinterpret_cast<const uint32_t*>(&fileData[i]);
+                            word = __builtin_bswap32(word);
+                            std::cout << "  [" << (i - currentPos) << "] 0x" << std::hex << std::setw(8) << std::setfill('0') << word << std::dec << "\n";
+                        }
+                    }
+                }
             }
 
             while (currentPos < rocDataEndPos && currentPos < fileData.size()) {
