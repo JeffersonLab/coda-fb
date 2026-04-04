@@ -663,12 +663,22 @@ public:
 
                 uint16_t payloadTag = (payloadBankHeader >> 16) & 0xFFFF;
                 uint8_t payloadType = (payloadBankHeader >> 8) & 0xFF;
+                uint8_t payloadNum = payloadBankHeader & 0xFF;  // Bits 7-0
 
-                int slotId = payloadTag;  // Payload bank tag IS the slot number!
+                // Determine slot ID: use Num field if Tag is standard 0xFF30
+                int slotId;
+                if (payloadTag == 0xFF30) {
+                    slotId = payloadNum;  // Use Num field (bits 7-0)
+                } else {
+                    slotId = payloadTag;  // Use Tag field
+                }
 
                 if (fadcVerbose) {
                     printIndent(4);
-                    std::cout << "[PAYLOAD BANK] Slot=" << slotId
+                    std::cout << "[PAYLOAD BANK] Tag=0x" << std::hex << payloadTag << std::dec
+                             << " Num=" << (int)payloadNum
+                             << " Type=0x" << std::hex << (int)payloadType << std::dec
+                             << " → Slot=" << slotId
                              << " Length=" << payloadBankLength << " words\n";
                 }
 
