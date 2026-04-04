@@ -701,15 +701,30 @@ public:
                 size_t payloadDataWords = (payloadBankLength > 1) ? (payloadBankLength - 1) : 0;
                 size_t payloadBytes = payloadDataWords * 4;
 
-                // The slot ID is in the Tag field (bits 31-16)
-                int slotId = payloadTag;
-
                 if (fadcVerbose) {
                     std::cout << "# DEBUG: Payload bank header=0x" << std::hex << payloadBankHeader << std::dec
-                             << " tag=" << payloadTag << " (slot=" << slotId << ")"
+                             << " tag=0x" << std::hex << payloadTag << std::dec
                              << " type=0x" << std::hex << (int)payloadType << std::dec
                              << " num=" << (int)payloadNum
                              << " payloadBytes=" << payloadBytes << "\n";
+                }
+
+                // Skip Stream Info Bank (tag 0xFF30) - it doesn't contain detector data
+                if (payloadTag == 0xFF30) {
+                    if (fadcVerbose) {
+                        std::cout << "# DEBUG: Skipping Stream Info Bank (tag=0xFF30)\n";
+                    }
+                    currentPos += payloadBytes;
+                    subBankIndex++;
+                    continue;
+                }
+
+                // For payload banks: slot number is in bits 4-0 of the Tag field
+                // (Payload Port # from the PP ID structure, range 0-20)
+                int slotId = payloadTag & 0x1F;  // Bits 4-0
+
+                if (fadcVerbose) {
+                    std::cout << "# DEBUG: Extracted slotId=" << slotId << " from tag bits 4-0\n";
                 }
 
                 if (verbose) {
