@@ -190,7 +190,7 @@ private:
     std::vector<FADCHit> decodeFADC250Payload(
         uint64_t frameTimestampNs,  // IMPORTANT: Assumed to be in nanoseconds
         int rocId,
-        int slotIdFallback,  // Fallback if block header not found
+        int slotId,  // Slot number from payload bank tag
         const uint8_t* payloadData,
         size_t payloadBytes
     ) {
@@ -200,6 +200,9 @@ private:
          * Bits 17-30: Time offset (14 bits, 0-16383, in 4ns bins)
          * Bits 13-16: Channel number (4 bits, 0-15)
          * Bits 0-12:  Integrated charge (13 bits, 0-8191)
+         *
+         * NO BLOCK HEADER: Payload contains only hit data words.
+         * Slot number comes from the EVIO payload bank tag.
          *
          * TIMESTAMP UNITS WARNING:
          * This function assumes frameTimestampNs is in nanoseconds.
@@ -222,71 +225,21 @@ private:
             return hits;
         }
 
-        // Parse FADC250 Block Header (first word)
-        // Format: [1][dataType(4)][slot(5)][blockNum(22)]
-        uint32_t blockHeader = 0;
-        std::memcpy(&blockHeader, payloadData, 4);
-        blockHeader = ntoh32(blockHeader);
-
-        int slotId = slotIdFallback;  // Default to fallback
-        size_t dataStartWord = 0;     // Start from first word if no valid header
-
-        // Check if first word is a valid FADC250 block header
-        bool hasBlockHeader = (blockHeader & 0x80000000) != 0;  // Bit 31 = 1
-        uint8_t dataType = (blockHeader >> 27) & 0x0F;          // Bits 27-30
-
-        // Debug: Always show first word analysis when FADC verbose enabled
-        if (fadcVerbose) {
-            printIndent(4);
-            std::cout << "[FADC250] First word: 0x" << std::hex << blockHeader << std::dec
-                     << " | Bit31=" << ((blockHeader & 0x80000000) ? "1" : "0")
-                     << " | DataType=0x" << std::hex << (int)dataType << std::dec
-                     << " | ExtractedSlot=" << ((blockHeader >> 22) & 0x1F)
-                     << " | FallbackSlot=" << slotIdFallback << "\n";
-        }
-
-        // FADC250 block headers typically have bit 31=1 and dataType=0x1
-        // Some formats may use dataType=0x0, so accept both
-        if (hasBlockHeader && (dataType == 0x0 || dataType == 0x1)) {
-            // Valid block header found
-            slotId = (blockHeader >> 22) & 0x1F;  // Bits 22-26 (5 bits)
-            uint32_t blockNum = blockHeader & 0x3FFFFF;  // Bits 0-21
-
-            if (fadcVerbose) {
-                printIndent(4);
-                std::cout << "[FADC250 Block Header] VALID - Slot=" << slotId
-                         << " BlockNum=" << blockNum
-                         << " DataType=0x" << std::hex << (int)dataType << std::dec << "\n";
-            }
-
-            dataStartWord = 1;  // Skip block header, start decoding from word 1
-        } else {
-            // No valid block header, decode all words as hit data
-            if (fadcVerbose) {
-                printIndent(4);
-                std::cout << "[FADC250 Warning] NO VALID BLOCK HEADER - using fallback slot="
-                         << slotIdFallback << " (ROC ID)\n";
-                printIndent(4);
-                std::cout << "  Reason: ";
-                if (!hasBlockHeader) {
-                    std::cout << "Bit 31 not set (expected 1 for header)\n";
-                } else {
-                    std::cout << "DataType=0x" << std::hex << (int)dataType << std::dec
-                             << " (expected 0x0 or 0x1)\n";
-                }
-            }
-        }
-
-        // Decode hit data words
-        for (size_t i = dataStartWord; i < numWords; i++) {
+        // Decode all words as hit data (no block header)
+        for (size_t i = 0; i < numWords; i++) {
             // Read 32-bit word in BIG_ENDIAN
             uint32_t word = 0;
             std::memcpy(&word, payloadData + (i * 4), 4);
             word = ntoh32(word);
 
             // Skip words that look like headers (bit 31 = 1)
+            // Though there shouldn't be any in this format
             if (word & 0x80000000) {
-                continue;  // Skip header words
+                if (fadcVerbose) {
+                    printIndent(5);
+                    std::cout << "[FADC250] Skipping header word: 0x" << std::hex << word << std::dec << "\n";
+                }
+                continue;
             }
 
             // Extract hit data fields (bit field extraction verified correct)
@@ -672,8 +625,91 @@ public:
         printField("Type", type, "", 3);
         printField("Stream Status", streamStatus, "", 3);
 
-        // Decode payload data (bankLength - 1 for header word we already read)
-        if (bankLength > 1) {
+        // Debug: Show ROC bank type when FADC verbose enabled
+        if (fadcVerbose) {
+            printIndent(3);
+            std::cout << "[ROC BANK] Tag=" << tag << " Type=0x" << std::hex << (int)type << std::dec;
+            if (type == 0x10) {
+                std::cout << " (BANK - should contain sub-banks)\n";
+            } else if (type == 0x20) {
+                std::cout << " (SEGMENT - direct data)\n";
+            } else if (type == 0x01) {
+                std::cout << " (INT - 32-bit integers)\n";
+            } else {
+                std::cout << " (unknown type)\n";
+            }
+        }
+
+        // Get ROC ID from stored list (use index if not available)
+        int rocId = (rocIndex < currentEventROCIds.size()) ? currentEventROCIds[rocIndex] : rocIndex;
+
+        // Check if this is a BANK (0x10) containing sub-banks, or direct data
+        if (type == 0x10) {
+            // ROC bank contains sub-banks (one per FADC slot)
+            // bankLength is exclusive, so actual data is (bankLength - 1) words
+            size_t rocDataWords = bankLength - 1;
+            size_t rocDataEndPos = currentPos + (rocDataWords * 4);
+
+            if (fadcVerbose) {
+                printIndent(3);
+                std::cout << "[ROC BANK] Parsing sub-banks (slots) within ROC " << rocId << "\n";
+            }
+
+            // Parse sub-banks (payload banks, one per slot)
+            while (currentPos < rocDataEndPos && currentPos < fileData.size()) {
+                // Read payload bank header
+                uint32_t payloadBankLength = read32();
+                uint32_t payloadBankHeader = read32();
+
+                uint16_t payloadTag = (payloadBankHeader >> 16) & 0xFFFF;
+                uint8_t payloadType = (payloadBankHeader >> 8) & 0xFF;
+
+                int slotId = payloadTag;  // Payload bank tag IS the slot number!
+
+                if (fadcVerbose) {
+                    printIndent(4);
+                    std::cout << "[PAYLOAD BANK] Slot=" << slotId
+                             << " Length=" << payloadBankLength << " words\n";
+                }
+
+                // Payload data (bankLength - 1 for the header we already read)
+                size_t payloadDataWords = (payloadBankLength > 1) ? (payloadBankLength - 1) : 0;
+                size_t payloadBytes = payloadDataWords * 4;
+
+                if (payloadBytes > 0) {
+                    const uint8_t* payloadData = &fileData[currentPos];
+
+                    // Decode FADC250 hit data (no block header, just hit words)
+                    std::vector<FADCHit> hits = decodeFADC250Payload(
+                        currentFrameTimestamp,
+                        rocId,
+                        slotId,  // Use payload bank tag as slot number
+                        payloadData,
+                        payloadBytes
+                    );
+
+                    // Print hits if FADC verbose enabled
+                    if (fadcVerbose && !hits.empty()) {
+                        printIndent(4);
+                        std::cout << "  FADC250 Hits: " << hits.size() << " hits\n";
+                        for (const auto& hit : hits) {
+                            printIndent(5);
+                            std::cout << "Crate=" << hit.crate
+                                     << " Slot=" << hit.slot
+                                     << " Chan=" << hit.channel
+                                     << " Charge=" << hit.charge
+                                     << " Time=" << hit.time << "ns\n";
+                        }
+                    }
+
+                    // Accumulate for event summary
+                    currentEventHits.insert(currentEventHits.end(), hits.begin(), hits.end());
+
+                    currentPos += payloadBytes;
+                }
+            }
+        } else {
+            // ROC bank contains direct data (old format or single slot)
             size_t payloadWords = bankLength - 1;
             size_t payloadBytes = payloadWords * 4;
 
@@ -684,17 +720,12 @@ public:
 
             printField("Payload Size", payloadBytes, "bytes", 3);
 
-            // Get ROC ID from stored list (use index if not available)
-            int rocId = (rocIndex < currentEventROCIds.size()) ? currentEventROCIds[rocIndex] : rocIndex;
-
-            // Decode FADC250 payload
-            // Note: tag is ROC ID (same as rocId), not slot number
-            // Actual slot number will be extracted from FADC250 block header
+            // Decode FADC250 payload (use ROC ID as slot fallback)
             const uint8_t* payloadData = &fileData[currentPos];
             std::vector<FADCHit> hits = decodeFADC250Payload(
                 currentFrameTimestamp,
                 rocId,
-                tag,  // Fallback slot if FADC250 block header not found (typically ROC ID)
+                tag,  // Use ROC bank tag as fallback slot
                 payloadData,
                 payloadBytes
             );
