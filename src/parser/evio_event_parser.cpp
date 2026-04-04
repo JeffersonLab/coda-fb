@@ -709,16 +709,6 @@ public:
                              << " payloadBytes=" << payloadBytes << "\n";
                 }
 
-                // Skip Stream Info Bank (tag 0xFF30) - it doesn't contain detector data
-                if (payloadTag == 0xFF30) {
-                    if (fadcVerbose) {
-                        std::cout << "# DEBUG: Skipping Stream Info Bank (tag=0xFF30)\n";
-                    }
-                    currentPos += payloadBytes;
-                    subBankIndex++;
-                    continue;
-                }
-
                 // For payload banks: slot number is in bits 4-0 of the Tag field
                 // (Payload Port # from the PP ID structure, range 0-20)
                 int slotId = payloadTag & 0x1F;  // Bits 4-0
