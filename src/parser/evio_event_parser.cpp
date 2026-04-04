@@ -674,19 +674,48 @@ public:
                 std::cout << "[ROC BANK] Parsing sub-banks (slots) within ROC " << rocId << "\n";
             }
 
-            // Parse all sub-banks as potential payload banks
-            // Don't skip any - even tag 0xFF30 can contain FADC data
+            // First, skip the Stream Info Bank (SIB) with tag 0xFF30
+            // Per page 21 of spec: ROC Time Slice Bank contains SIB followed by payload banks
+            if (currentPos < rocDataEndPos) {
+                uint32_t sibLength = read32();
+                uint32_t sibHeader = read32();
+                uint16_t sibTag = (sibHeader >> 16) & 0xFFFF;
+
+                if (fadcVerbose) {
+                    std::cout << "# DEBUG: First bank in ROC: tag=0x" << std::hex << sibTag << std::dec
+                             << " length=" << sibLength << "\n";
+                }
+
+                if (sibTag == 0xFF30) {
+                    // Skip the Stream Info Bank data
+                    size_t sibDataWords = (sibLength > 1) ? (sibLength - 1) : 0;
+                    size_t sibBytes = sibDataWords * 4;
+                    currentPos += sibBytes;
+
+                    if (fadcVerbose) {
+                        std::cout << "# DEBUG: Skipped Stream Info Bank (0xFF30), "
+                                 << sibBytes << " bytes\n";
+                    }
+                } else {
+                    // Not a SIB, rewind and treat as payload bank
+                    currentPos -= 8;
+                    if (fadcVerbose) {
+                        std::cout << "# DEBUG: No SIB found, rewinding to parse as payload\n";
+                    }
+                }
+            }
+
+            // Now parse payload port banks
             int subBankIndex = 0;
 
             if (fadcVerbose) {
-                std::cout << "# DEBUG: Entering sub-bank loop, condition: currentPos(" << currentPos
-                         << ") < rocDataEndPos(" << rocDataEndPos << ") = "
-                         << (currentPos < rocDataEndPos ? "true" : "false") << "\n";
+                std::cout << "# DEBUG: Entering payload bank loop, currentPos=" << currentPos
+                         << " rocDataEndPos=" << rocDataEndPos << "\n";
             }
 
             while (currentPos < rocDataEndPos && currentPos < fileData.size()) {
                 if (fadcVerbose) {
-                    std::cout << "# DEBUG: Sub-bank loop iteration " << subBankIndex
+                    std::cout << "# DEBUG: Payload bank iteration " << subBankIndex
                              << " at position " << currentPos << "\n";
                 }
                 // Read payload bank header
@@ -709,12 +738,11 @@ public:
                              << " payloadBytes=" << payloadBytes << "\n";
                 }
 
-                // For payload banks: slot number is in bits 4-0 of the Tag field
-                // (Payload Port # from the PP ID structure, range 0-20)
-                int slotId = payloadTag & 0x1F;  // Bits 4-0
+                // Slot number is the TAG of the payload bank (per page 21 of spec)
+                int slotId = payloadTag;
 
                 if (fadcVerbose) {
-                    std::cout << "# DEBUG: Extracted slotId=" << slotId << " from tag bits 4-0\n";
+                    std::cout << "# DEBUG: Extracted slotId=" << slotId << " from payload bank TAG\n";
                 }
 
                 if (verbose) {
