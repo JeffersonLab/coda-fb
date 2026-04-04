@@ -190,7 +190,7 @@ private:
     std::vector<FADCHit> decodeFADC250Payload(
         uint64_t frameTimestampNs,
         int rocId,
-        int slotId,
+        int slotIdFallback,  // Fallback if block header not found
         const uint8_t* payloadData,
         size_t payloadBytes
     ) {
@@ -205,13 +205,57 @@ private:
 
         size_t numWords = payloadBytes / 4;
 
-        for (size_t i = 0; i < numWords; i++) {
+        if (numWords == 0) {
+            return hits;
+        }
+
+        // Parse FADC250 Block Header (first word)
+        // Format: [1][dataType(4)][slot(5)][blockNum(22)]
+        uint32_t blockHeader = 0;
+        std::memcpy(&blockHeader, payloadData, 4);
+        blockHeader = ntoh32(blockHeader);
+
+        int slotId = slotIdFallback;  // Default to fallback
+        size_t dataStartWord = 0;     // Start from first word if no valid header
+
+        // Check if first word is a valid FADC250 block header
+        bool hasBlockHeader = (blockHeader & 0x80000000) != 0;  // Bit 31 = 1
+        uint8_t dataType = (blockHeader >> 27) & 0x0F;          // Bits 27-30
+
+        if (hasBlockHeader && dataType == 0x0) {
+            // Valid block header found
+            slotId = (blockHeader >> 22) & 0x1F;  // Bits 22-26 (5 bits)
+            uint32_t blockNum = blockHeader & 0x3FFFFF;  // Bits 0-21
+
+            if (verbose) {
+                printIndent(4);
+                std::cout << "[FADC250 Block Header] Slot=" << slotId
+                         << " BlockNum=" << blockNum << "\n";
+            }
+
+            dataStartWord = 1;  // Skip block header, start decoding from word 1
+        } else {
+            // No valid block header, decode all words as hit data
+            if (verbose) {
+                printIndent(4);
+                std::cout << "[FADC250 Warning] No valid block header found, using fallback slot="
+                         << slotIdFallback << "\n";
+            }
+        }
+
+        // Decode hit data words
+        for (size_t i = dataStartWord; i < numWords; i++) {
             // Read 32-bit word in BIG_ENDIAN
             uint32_t word = 0;
             std::memcpy(&word, payloadData + (i * 4), 4);
             word = ntoh32(word);
 
-            // Extract fields
+            // Skip words that look like headers (bit 31 = 1)
+            if (word & 0x80000000) {
+                continue;  // Skip header words
+            }
+
+            // Extract hit data fields
             int charge = word & 0x1FFF;                        // Bits 0-12
             int channel = (word >> 13) & 0x000F;               // Bits 13-16
             uint64_t timeOffset = ((word >> 17) & 0x3FFF) * 4; // Bits 17-30, * 4ns
@@ -221,7 +265,8 @@ private:
             // Validation
             if (channel > 15) {
                 result.addWarning("Invalid FADC250 channel: " + std::to_string(channel) +
-                                " in ROC " + std::to_string(rocId));
+                                " in ROC " + std::to_string(rocId) + " slot " + std::to_string(slotId));
+                continue;
             }
 
             hits.emplace_back(rocId, slotId, channel, charge, hitTime);
@@ -601,11 +646,13 @@ public:
             int rocId = (rocIndex < currentEventROCIds.size()) ? currentEventROCIds[rocIndex] : rocIndex;
 
             // Decode FADC250 payload
+            // Note: tag is ROC ID (same as rocId), not slot number
+            // Actual slot number will be extracted from FADC250 block header
             const uint8_t* payloadData = &fileData[currentPos];
             std::vector<FADCHit> hits = decodeFADC250Payload(
                 currentFrameTimestamp,
                 rocId,
-                tag,  // Slot number from payload bank header tag
+                tag,  // Fallback slot if FADC250 block header not found (typically ROC ID)
                 payloadData,
                 payloadBytes
             );
