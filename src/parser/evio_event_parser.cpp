@@ -701,21 +701,15 @@ public:
                 size_t payloadDataWords = (payloadBankLength > 1) ? (payloadBankLength - 1) : 0;
                 size_t payloadBytes = payloadDataWords * 4;
 
-                if (fadcVerbose) {
-                    std::cout << "# DEBUG: Read payload bank header: length=" << payloadBankLength
-                             << " tag=0x" << std::hex << payloadTag << std::dec
-                             << " type=0x" << std::hex << (int)payloadType << std::dec
-                             << " payloadBytes=" << payloadBytes << "\n";
-                }
+                // The slot ID is in the Tag field (bits 31-16)
+                int slotId = payloadTag;
 
-                // Determine slot ID:
-                // - If tag is 0xFF30 (standard payload tag), use Num field (bits 7-0)
-                // - Otherwise, use Tag field directly
-                int slotId;
-                if (payloadTag == 0xFF30) {
-                    slotId = payloadNum;  // Use Num field for standard payload banks
-                } else {
-                    slotId = payloadTag;  // Use Tag for custom banks
+                if (fadcVerbose) {
+                    std::cout << "# DEBUG: Payload bank header=0x" << std::hex << payloadBankHeader << std::dec
+                             << " tag=" << payloadTag << " (slot=" << slotId << ")"
+                             << " type=0x" << std::hex << (int)payloadType << std::dec
+                             << " num=" << (int)payloadNum
+                             << " payloadBytes=" << payloadBytes << "\n";
                 }
 
                 if (verbose) {

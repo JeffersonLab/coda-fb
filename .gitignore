@@ -1,0 +1,21 @@
+# Compiled binaries
+evio_event_parser
+src/parser/evio_event_parser
+
+# Build directories
+build/
+builddir/
+
+# Object files
+*.o
+*.obj
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Meson build files
+.ninja_deps
+.ninja_log
+compile_commands.json
