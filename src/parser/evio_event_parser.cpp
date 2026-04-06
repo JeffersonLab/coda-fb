@@ -221,15 +221,7 @@ private:
 
         size_t numWords = payloadBytes / 4;
 
-        if (fadcVerbose) {
-            std::cout << "# DEBUG: decodeFADC250Payload crate=" << rocId << " slot=" << slotId
-                     << " bytes=" << payloadBytes << " words=" << numWords << "\n";
-        }
-
         if (numWords == 0) {
-            if (fadcVerbose) {
-                std::cout << "# DEBUG: No words to decode (empty payload)\n";
-            }
             return hits;
         }
 
@@ -652,22 +644,11 @@ public:
         int rocId = (rocIndex < currentEventROCIds.size()) ? currentEventROCIds[rocIndex] : rocIndex;
 
         // Check if this is a BANK (0x10) containing sub-banks, or direct data
-        if (fadcVerbose) {
-            std::cout << "# DEBUG: ROC " << rocId << " type=0x" << std::hex << (int)type << std::dec
-                     << " tag=" << tag << " length=" << bankLength << "\n";
-        }
-
         if (type == 0x10) {
             // ROC bank contains sub-banks (one per FADC slot)
             // bankLength is exclusive, so actual data is (bankLength - 1) words
             size_t rocDataWords = bankLength - 1;
             size_t rocDataEndPos = currentPos + (rocDataWords * 4);
-
-            if (fadcVerbose) {
-                std::cout << "# DEBUG: ROC BANK type=0x10, rocDataWords=" << rocDataWords
-                         << " rocDataEndPos=" << rocDataEndPos
-                         << " currentPos=" << currentPos << "\n";
-            }
 
             if (verbose) {
                 printIndent(3);
@@ -681,56 +662,21 @@ public:
                 uint32_t sibHeader = read32();
                 uint16_t sibTag = (sibHeader >> 16) & 0xFFFF;
 
-                if (fadcVerbose) {
-                    std::cout << "# DEBUG: First bank in ROC: tag=0x" << std::hex << sibTag << std::dec
-                             << " length=" << sibLength << "\n";
-                }
-
                 if (sibTag == 0xFF30) {
                     // Skip the Stream Info Bank data
                     size_t sibDataWords = (sibLength > 1) ? (sibLength - 1) : 0;
                     size_t sibBytes = sibDataWords * 4;
                     currentPos += sibBytes;
-
-                    if (fadcVerbose) {
-                        std::cout << "# DEBUG: Skipped Stream Info Bank (0xFF30), "
-                                 << sibBytes << " bytes\n";
-                    }
                 } else {
                     // Not a SIB, rewind and treat as payload bank
                     currentPos -= 8;
-                    if (fadcVerbose) {
-                        std::cout << "# DEBUG: No SIB found, rewinding to parse as payload\n";
-                    }
                 }
             }
 
             // Now parse payload port banks
             int subBankIndex = 0;
 
-            if (fadcVerbose) {
-                std::cout << "# DEBUG: Entering payload bank loop, currentPos=" << currentPos
-                         << " rocDataEndPos=" << rocDataEndPos
-                         << " remaining=" << (rocDataEndPos - currentPos) << " bytes\n";
-
-                // Hex dump of remaining ROC data
-                if (rocDataEndPos - currentPos > 0) {
-                    std::cout << "# DEBUG: Hex dump of remaining " << (rocDataEndPos - currentPos) << " bytes:\n";
-                    for (size_t i = currentPos; i < rocDataEndPos && i < currentPos + 64; i += 4) {
-                        if (i + 4 <= rocDataEndPos) {
-                            uint32_t word = *reinterpret_cast<const uint32_t*>(&fileData[i]);
-                            word = __builtin_bswap32(word);
-                            std::cout << "  [" << (i - currentPos) << "] 0x" << std::hex << std::setw(8) << std::setfill('0') << word << std::dec << "\n";
-                        }
-                    }
-                }
-            }
-
             while (currentPos < rocDataEndPos && currentPos < fileData.size()) {
-                if (fadcVerbose) {
-                    std::cout << "# DEBUG: Payload bank iteration " << subBankIndex
-                             << " at position " << currentPos << "\n";
-                }
                 // Read payload bank header
                 uint32_t payloadBankLength = read32();
                 uint32_t payloadBankHeader = read32();
@@ -767,10 +713,6 @@ public:
                         // Found next payload bank
                         payloadBytes = scanPos - dataStartPos;
                         foundNextBank = true;
-                        if (fadcVerbose) {
-                            std::cout << "# DEBUG: Found next bank at offset " << (scanPos - dataStartPos)
-                                     << ", tag=0x" << std::hex << peekTag << std::dec << "\n";
-                        }
                         break;
                     }
 
@@ -780,30 +722,12 @@ public:
                 if (!foundNextBank) {
                     // No next bank found, data extends to end of ROC
                     payloadBytes = rocDataEndPos - dataStartPos;
-                    if (fadcVerbose) {
-                        std::cout << "# DEBUG: No next bank found, using remaining ROC space: "
-                                 << payloadBytes << " bytes\n";
-                    }
                 }
 
                 size_t payloadDataWords = payloadBytes / 4;
 
-                if (fadcVerbose) {
-                    std::cout << "# DEBUG: Payload Port Length field=" << payloadBankLength << " words (unreliable)\n";
-                    std::cout << "# DEBUG: Calculated payload size=" << payloadBytes << " bytes ("
-                             << payloadDataWords << " words) via getRawBytes() approach\n";
-                    std::cout << "# DEBUG: Payload bank header=0x" << std::hex << payloadBankHeader << std::dec
-                             << " tag=0x" << std::hex << payloadTag << std::dec
-                             << " type=0x" << std::hex << (int)payloadType << std::dec
-                             << " num=" << (int)payloadNum << "\n";
-                }
-
                 // Slot number is the TAG of the payload bank (per page 21 of spec)
                 int slotId = payloadTag;
-
-                if (fadcVerbose) {
-                    std::cout << "# DEBUG: Extracted slotId=" << slotId << " from payload bank TAG\n";
-                }
 
                 if (verbose) {
                     printIndent(4);
@@ -815,12 +739,6 @@ public:
                 subBankIndex++;
 
                 if (payloadBytes > 0) {
-                    if (fadcVerbose) {
-                        std::cout << "# DEBUG: Decoding payload: rocId=" << rocId
-                                 << " slotId=" << slotId
-                                 << " payloadBytes=" << payloadBytes << "\n";
-                    }
-
                     const uint8_t* payloadData = &fileData[currentPos];
 
                     // Decode FADC250 hit data (no block header, just hit words)
@@ -833,18 +751,13 @@ public:
                     );
 
                     // Print hits if FADC verbose enabled (one line per hit)
-                    if (fadcVerbose) {
-                        if (hits.empty()) {
-                            std::cout << "# DEBUG: No hits decoded from slot " << slotId
-                                     << " (" << payloadBytes << " bytes)\n";
-                        } else {
-                            for (const auto& hit : hits) {
-                                std::cout << "crate=" << hit.crate
-                                         << ", slot=" << hit.slot
-                                         << ", channel=" << hit.channel
-                                         << ", charge=" << hit.charge
-                                         << ", time=" << hit.time << "\n";
-                            }
+                    if (fadcVerbose && !hits.empty()) {
+                        for (const auto& hit : hits) {
+                            std::cout << "crate=" << hit.crate
+                                     << ", slot=" << hit.slot
+                                     << ", channel=" << hit.channel
+                                     << ", charge=" << hit.charge
+                                     << ", time=" << hit.time << "\n";
                         }
                     }
 
@@ -852,16 +765,7 @@ public:
                     currentEventHits.insert(currentEventHits.end(), hits.begin(), hits.end());
 
                     currentPos += payloadBytes;
-                } else {
-                    if (fadcVerbose) {
-                        std::cout << "# DEBUG: Payload bytes is 0, skipping decode\n";
-                    }
                 }
-            }
-
-            if (fadcVerbose) {
-                std::cout << "# DEBUG: Exited sub-bank loop, currentPos=" << currentPos
-                         << " rocDataEndPos=" << rocDataEndPos << "\n";
             }
         } else {
             // ROC bank contains direct data (old format or single slot)
@@ -908,10 +812,6 @@ public:
         currentEventHits.clear();
         currentEventROCIds.clear();
 
-        if (fadcVerbose) {
-            std::cout << "# DEBUG: parseEvent() called at position " << currentPos << "\n";
-        }
-
         // Parse aggregated frame structure
         parseAggregatedFrameBank();
         parseStreamInfoBank();
@@ -934,19 +834,11 @@ public:
         parseAggregationInfoSegment();
 
         // Parse ROC payload banks
-        if (fadcVerbose) {
-            std::cout << "# DEBUG: Parsing " << rocCount << " ROC banks\n";
-        }
-
         for (int i = 0; i < rocCount && currentPos < fileData.size(); i++) {
             parseROCPayloadBank(i);
         }
 
         // Event hits already printed during parsing (one line per hit)
-        if (fadcVerbose) {
-            std::cout << "# DEBUG: Event complete, total hits in currentEventHits: "
-                     << currentEventHits.size() << "\n";
-        }
     }
 
     void parse() {
