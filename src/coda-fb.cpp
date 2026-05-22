@@ -167,13 +167,8 @@ void performFinalCleanup()
 
     if (reasPtr != nullptr)
     {
-        std::cout << "Deregistering worker from control plane..." << std::endl;
-        auto deregres = reasPtr->deregisterWorker();
-        if (deregres.has_error())
-            std::cerr << "Unable to deregister worker on exit: " << deregres.error().message() << std::endl;
-
-        // NOTE: stopThreads() was already called in receiveAndWriteFrames()
-        // Don't call it again here
+        // NOTE: deregisterWorker() and stopThreads() were already called in
+        // receiveAndWriteFrames() before any blocking stop calls. Don't repeat them here.
 
         // Print final statistics
         // getStats() returns a tuple: <eventsRecvd, eventsReassembled, dataErrCnt, reassemblyLoss, enqueueLoss, lastE2SARError>
@@ -722,24 +717,35 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
     // ========================================================================
     std::cout << "\nFrame reception loop completed" << std::endl;
 
-    // IMPORTANT: Stop reassembler FIRST to prevent new data from being added
-    // to the frame builder while we're trying to shut it down!
+    // Deregister from the LB FIRST, before any blocking stop calls.
+    // This ensures the LB stops sending data even if thread shutdown hangs.
+    if (r != nullptr) {
+        std::cout << "Deregistering worker from control plane..." << std::endl;
+        auto deregres = r->deregisterWorker();
+        if (deregres.has_error())
+            std::cerr << "Unable to deregister worker: " << deregres.error().message() << std::endl;
+        else
+            std::cout << "Worker deregistered successfully" << std::endl;
+    }
+
+    // Stop reassembler threads after deregistering so no new frames arrive.
     if (r != nullptr) {
         std::cout << "Stopping reassembler threads..." << std::endl;
         r->stopThreads();
         std::cout << "Reassembler threads stopped" << std::endl;
     }
 
-    // Now stop frame builder if it was used (no more data will arrive)
+    // Stop frame builder if it was used (no more data will arrive after stopThreads).
     if (frameBuilder != nullptr) {
         frameBuilder->stop();
     }
 
-    // Close output file if open
+    // Close output file if open.
     if (outputFd >= 0) {
         std::cout << "Closing output file..." << std::endl;
-        fsync(outputFd);  // Ensure all data is written to disk
+        fsync(outputFd);
         close(outputFd);
+        globalOutputFd = -1;  // Prevent double-close in performFinalCleanup()
         std::cout << "Output file closed" << std::endl;
     }
 
