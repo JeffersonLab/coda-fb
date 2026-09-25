@@ -136,21 +136,33 @@ ARG CODA_FB_BUILDTYPE=release
 COPY meson.build meson_options.txt /src/coda-fb/
 COPY src/ /src/coda-fb/src/
 
-# Unset CODA so meson.build's install-dir logic resolves to the explicit prefix
-# rather than $CODA/Linux-x86_64/bin.
+# coda-fb's meson.build treats a prefix of exactly /usr/local as "no prefix
+# given" and then falls back to $CODA/Linux-x86_64/bin, or to $HOME/.local/bin
+# when CODA is unset. Neither is under /usr/local, which is all the runtime
+# stage copies. Pass a non-sentinel prefix so the plain "custom prefix" branch
+# is taken, then place the binaries in /usr/local/bin next to everything else.
+ARG CODA_FB_PREFIX=/opt/coda-fb
+
 RUN cd /src/coda-fb \
     && env -u CODA meson setup builddir \
         --buildtype="${CODA_FB_BUILDTYPE}" \
-        --prefix /usr/local \
+        --prefix "${CODA_FB_PREFIX}" \
         -Dpkg_config_path="${PKG_CONFIG_PATH}" \
     && meson compile -C builddir -j "$(nproc)" \
     && meson install -C builddir \
+    && install -m 0755 "${CODA_FB_PREFIX}/bin/coda-fb" /usr/local/bin/coda-fb \
+    && install -m 0755 "${CODA_FB_PREFIX}/bin/evio_event_parser" /usr/local/bin/evio_event_parser \
     && ldconfig
 
 # Fail the build here rather than at deploy time if the frame builder was not
 # compiled in (missing ET) or a shared library cannot be resolved.
+# test -x comes first on purpose: ldd on a missing file writes to stderr and
+# prints nothing on stdout, so "! ldd ... | grep -q 'not found'" succeeds for a
+# binary that was never installed.
 RUN grep -q 'ENABLE_FRAME_BUILDER' /src/coda-fb/builddir/compile_commands.json \
         || (echo "FATAL: ENABLE_FRAME_BUILDER not defined - ET was not detected" >&2; exit 1) \
+    && test -x /usr/local/bin/coda-fb \
+    && test -x /usr/local/bin/evio_event_parser \
     && ! ldd /usr/local/bin/coda-fb | grep -q 'not found' \
     && ! ldd /usr/local/bin/evio_event_parser | grep -q 'not found'
 
@@ -187,7 +199,10 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Verify the runtime image can actually resolve everything it needs.
-RUN ldd /usr/local/bin/coda-fb | grep -q 'not found' && exit 1 || true \
+RUN test -x /usr/local/bin/coda-fb \
+    && test -x /usr/local/bin/evio_event_parser \
+    && ! ldd /usr/local/bin/coda-fb | grep -q 'not found' \
+    && ! ldd /usr/local/bin/evio_event_parser | grep -q 'not found' \
     && coda-fb --help > /dev/null \
     && evio_event_parser --help > /dev/null
 
