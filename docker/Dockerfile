@@ -87,18 +87,31 @@ RUN git clone --depth 1 --branch "${ET_REF}" "${ET_REPO}" /src/et \
     && test -x /usr/local/bin/et_start
 
 # --- E2SAR ----------------------------------------------------------------
-# Needs --recurse-submodules for the UDPLBd protobuf definitions, and git-lfs
-# for the binary artifacts. Pinned by ref so the image matches the API that
-# coda-fb compiles against.
+# Pinned by ref so the image matches the API that coda-fb compiles against.
+# There is no final v0.4.0 tag upstream; v0.4.0rc1 is the latest candidate.
+#
+# Three things matter in the clone below:
+#  1. The ref is checked out BEFORE submodules are initialised. Passing
+#     --recurse-submodules to git clone resolves submodules against the DEFAULT
+#     branch's .gitmodules, not the tag's, and on main those entries are
+#     git@github.com: SSH URLs.
+#  2. insteadOf rewrites any remaining SSH URL to HTTPS. A container has no SSH
+#     key, and git fails with "cannot run ssh: No such file or directory".
+#  3. Only udplbd2 is initialised: E2SAR's meson.build reads
+#     ../udplbd2/proto/loadbalancer/loadbalancer.proto to generate the gRPC
+#     stubs. docs and wiki are documentation repositories the build never uses.
+#
+# git-lfs is not exercised: .gitattributes only marks *.tar.gz as LFS and
+# nothing under that filter is needed to compile.
 ARG E2SAR_REPO=https://github.com/JeffersonLab/E2SAR.git
 ARG E2SAR_REF=v0.4.0rc1
 
-RUN git lfs install \
-    && git clone --recurse-submodules "${E2SAR_REPO}" /src/e2sar \
+RUN git config --global url."https://github.com/".insteadOf "git@github.com:" \
+    && git clone "${E2SAR_REPO}" /src/e2sar \
     && cd /src/e2sar \
     && git checkout "${E2SAR_REF}" \
-    && git submodule update --init --recursive \
-    && git lfs pull
+    && git submodule update --init --recursive udplbd2 \
+    && test -f udplbd2/proto/loadbalancer/loadbalancer.proto
 
 # The first setup plus the -std=c++11 strip is the upstream workaround from
 # E2SAR's own Dockerfile.cli; the second setup regenerates with it applied.
