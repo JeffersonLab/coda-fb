@@ -1,0 +1,45 @@
+# CODA Frame Builder - deployment on a remote DAQ host.
+#
+#   cp docker/coda-fb.env.example coda-fb.env && $EDITOR coda-fb.env
+#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose -f docker/docker-compose.yml logs -f
+#   docker compose -f docker/docker-compose.yml down
+#
+# Host networking is not optional: coda-fb registers RECEIVER_IP with the EJFAT
+# control plane and the load balancer sends UDP straight to it, across a port
+# range that depends on THREADS. Bridge networking would advertise an
+# unreachable address.
+
+services:
+  coda-fb:
+    image: ${CODA_FB_IMAGE:-coda-fb:latest}
+    container_name: coda-fb
+
+    network_mode: host
+
+    # Needed only when RUN_ET_START=1 or when attaching to an ET system running
+    # on the host through its shared-memory file. Harmless otherwise.
+    ipc: host
+
+    env_file:
+      - ../coda-fb.env
+
+    volumes:
+      # EVIO-6 output. Left side is the host path; adjust to your data area.
+      - ${CODA_FB_DATA:-/data/frames}:/data
+      # Only needed for a local/host ET system, so the memory-mapped file is
+      # visible on both sides. Drop this line for a remote ET or file-only run.
+      - /tmp:/tmp
+
+    # coda-fb handles SIGINT; the entrypoint translates SIGTERM into it and
+    # allows SHUTDOWN_GRACE seconds for load-balancer deregistration.
+    stop_signal: SIGTERM
+    stop_grace_period: 90s
+
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

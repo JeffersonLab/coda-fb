@@ -1,0 +1,28 @@
+# Build context for docker/Dockerfile is the repository root.
+# Only meson.build, meson_options.txt, src/ and docker/ are actually needed.
+
+.git
+.gitignore
+.DS_Store
+**/.DS_Store
+.claude
+
+# Local build output
+builddir/
+build/
+*.o
+*.obj
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# Prebuilt binaries
+evio_event_parser
+src/parser/evio_event_parser
+
+# Large docs not needed to compile
+doc/
+
+# Data
+*.evio
+*.bin
