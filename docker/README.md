@@ -8,9 +8,9 @@ on the target machine.
 
 | Component | Source | Default |
 |---|---|---|
-| Boost, gRPC, protobuf, Abseil | E2SAR `e2sar-deps` package, under `/usr/local` | `0.2.2` / `ubuntu-22.04` |
+| Boost 1.89.0, gRPC 1.74.1, protobuf, Abseil | E2SAR `e2sar-deps` package, under `/usr/local` | `0.4.0rc1` / `ubuntu-22.04` |
 | ET | built from `JeffersonLab/et` | `v16.6.0` |
-| E2SAR | built from `JeffersonLab/E2SAR` (submodules + LFS) | `6629c0f` (v0.2.2) |
+| E2SAR | built from `JeffersonLab/E2SAR` (submodules + LFS) | `v0.4.0rc1` |
 | `coda-fb`, `evio_event_parser` | this repository | working tree |
 
 ---
@@ -26,7 +26,7 @@ Or with plain Docker:
 
 ```bash
 docker build -f docker/Dockerfile -t coda-fb:v1.0.0 \
-  --build-arg E2SAR_REF=6629c0f \
+  --build-arg E2SAR_REF=v0.4.0rc1 \
   --build-arg ET_REF=v16.6.0 .
 ```
 
@@ -50,8 +50,8 @@ docker buildx use amd
 ```
 -t, --tag TAG              Image tag (default: coda-fb:latest)
     --platform PLATFORM    Target platform (default: linux/amd64)
-    --e2sar-ref REF        E2SAR git ref (default: 6629c0f)
-    --e2sar-deps-ver VER   Dependency bundle version (default: 0.2.2)
+    --e2sar-ref REF        E2SAR git ref (default: v0.4.0rc1)
+    --e2sar-deps-ver VER   Dependency bundle version (default: 0.4.0rc1)
     --et-ref REF           ET git ref (default: v16.6.0)
     --buildtype TYPE       meson buildtype (default: release)
     --save FILE            Save image to a gzipped tarball
@@ -63,6 +63,15 @@ Moving `--e2sar-ref` to a newer release may require also moving
 `--e2sar-deps-ver` and fixing compile errors in `src/coda-fb.cpp` if the
 `Reassembler` / `recvEvent` API changed. The defaults are the versions coda-fb
 currently compiles against.
+
+**There is no final `v0.4.0` tag upstream.** The E2SAR repository has
+`v0.4.0a1` and `v0.4.0rc1` plus a `v0.4.0-wip` branch; `v0.4.0rc1` is the
+newest release candidate and is what these defaults pin. Re-pin once a final
+tag is published.
+
+E2SAR 0.4.0 requires **Boost exactly 1.89.0** and **gRPC 1.74.1**, both supplied
+by the `e2sar-deps` bundle. Keep `--e2sar-deps-ver` in step with `--e2sar-ref`;
+mixing a 0.2.x bundle with a 0.4.0 source tree will not link.
 
 ---
 
@@ -141,6 +150,42 @@ Shifter needs the image named on the job (`--image=...`), unlike podman-hpc.
 ---
 
 ## 4. Run interactively on Perlmutter
+
+### The URI coda-fb needs
+
+`coda-fb --uri` expects the **instance URI** returned when the load balancer is
+reserved, not the base control-plane URI. Reserving is a separate step that
+happens wherever you manage the LB — commonly a JLab host or your own
+workstation, not a Perlmutter login node. Perlmutter only needs the resulting
+instance URI.
+
+Bring it across and keep it out of the job script, since it carries an instance
+token:
+
+```bash
+# on Perlmutter, from the instance URI produced wherever you reserved
+export EJFAT_URI='ejfat://<instance-token>@<lb-host>:<port>/lb/<id>?data=...&sync=...'
+
+# or stage it in a private file and source it from the job
+install -m 600 /dev/stdin ~/.ejfat_uri <<< "$EJFAT_URI"
+export EJFAT_URI=$(cat ~/.ejfat_uri)
+```
+
+Two things to watch when the reservation is made off-site:
+
+- **The reservation has to outlive the queue wait.** A Perlmutter job can sit
+  queued for a long time; if the LB reservation expires before the job starts,
+  `coda-fb` fails at registration. Reserve for longer than you think you need,
+  or reserve indefinitely — E2SAR 0.3.0 made `lbadm -d '00:00:00'` the default
+  for that.
+- **The receiver address is decided on Perlmutter, not at reservation time.**
+  `RECEIVER_IP` is whatever compute node Slurm gives you, which is why the batch
+  example below computes it at run time rather than baking it in.
+
+E2SAR ships worked Perlmutter/Slurm examples in `scripts/zero_to_hero/` with
+notes in `docs/RunningSlurmOnPerlmutter.md`. They reserve from a login node,
+which differs from an off-site workflow, but the job-orchestration side still
+applies.
 
 Get an interactive allocation first — do not run the receiver on a login node:
 
@@ -257,7 +302,8 @@ wait $CID
 Submit and monitor:
 
 ```bash
-export EJFAT_URI='ejfat://token@cp-host:18347/lb/1?data=0.0.0.0:10000'
+# the instance URI from your LB reservation (see section 4)
+export EJFAT_URI=$(cat ~/.ejfat_uri)
 sbatch coda-fb.sbatch
 
 squeue --me
@@ -372,7 +418,7 @@ and override the environment.
 
 | Variable | Flag | Notes |
 |---|---|---|
-| `EJFAT_URI` | `--uri` | Control-plane URI, carries an instance token. |
+| `EJFAT_URI` | `--uri` | The **instance** URI returned when the load balancer is reserved, not the base control-plane URI. Carries an instance token. |
 | `RECEIVER_IP` | `--ip` | Or `AUTO_IP=1` for `--autoip`. Exactly one of the two. |
 
 **Receiver**

@@ -6,7 +6,7 @@
 #   ./docker/build.sh --tag coda-fb:v1.0.0
 #   ./docker/build.sh --save coda-fb.tar.gz            # tarball for scp/docker load
 #   ./docker/build.sh --push registry.example.org/daq  # build and push
-#   ./docker/build.sh --e2sar-ref v0.2.2 --et-ref v16.6.0
+#   ./docker/build.sh --e2sar-ref v0.4.0rc1 --et-ref v16.6.0
 #
 # Run from the repository root (or anywhere - the script locates it itself).
 
@@ -28,8 +28,8 @@ NO_CACHE=""
 PROGRESS="auto"
 
 # Defaults match the versions coda-fb is developed against.
-E2SAR_REF="6629c0f"
-E2SAR_DEPS_VER="0.2.2"
+E2SAR_REF="v0.4.0rc1"
+E2SAR_DEPS_VER="0.4.0rc1"
 E2SAR_DEPS_DISTRO="ubuntu-22.04"
 ET_REF="v16.6.0"
 BUILDTYPE="release"

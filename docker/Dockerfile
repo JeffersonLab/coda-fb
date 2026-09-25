@@ -16,11 +16,11 @@
 # ---------------------------------------------------------------------------
 FROM ubuntu:22.04 AS base
 
-# E2SAR publishes a dependency bundle (Boost 1.83-1.86 with Boost.URL, gRPC
-# >=1.51.1, protobuf and Abseil) per release and distro, installed under
+# E2SAR publishes a dependency bundle (Boost 1.89.0 with Boost.URL and
+# Boost.Log, gRPC 1.74.1, protobuf and Abseil) per release and distro, under
 # /usr/local. coda-fb's meson.build explicitly searches /usr/local/lib64,
 # /usr/local/lib and /usr/local/include, so this is the layout it expects.
-ARG E2SAR_DEPS_VER=0.2.2
+ARG E2SAR_DEPS_VER=0.4.0rc1
 ARG E2SAR_DEPS_DISTRO=ubuntu-22.04
 ARG E2SAR_DEPS_URL=https://github.com/JeffersonLab/E2SAR/releases/download/E2SAR-${E2SAR_DEPS_VER}-main-${E2SAR_DEPS_DISTRO}/e2sar-deps_${E2SAR_DEPS_VER}_amd64.deb
 
@@ -91,7 +91,7 @@ RUN git clone --depth 1 --branch "${ET_REF}" "${ET_REPO}" /src/et \
 # for the binary artifacts. Pinned by ref so the image matches the API that
 # coda-fb compiles against.
 ARG E2SAR_REPO=https://github.com/JeffersonLab/E2SAR.git
-ARG E2SAR_REF=6629c0f
+ARG E2SAR_REF=v0.4.0rc1
 
 RUN git lfs install \
     && git clone --recurse-submodules "${E2SAR_REPO}" /src/e2sar \

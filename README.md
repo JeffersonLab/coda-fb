@@ -17,9 +17,9 @@ UDP from EJFAT LB
 **Required:**
 - C++17 compiler (GCC 8+, Clang 6+)
 - Meson ≥0.55, Ninja
-- [E2SAR](https://github.com/JeffersonLab/E2SAR) library (with pkg-config)
-- Boost ≥1.83.0, ≤1.86.0 (system, program_options, chrono, thread, filesystem, url) — located via CMake
-- gRPC++ ≥1.51.1
+- [E2SAR](https://github.com/JeffersonLab/E2SAR) ≥0.4.0rc1 (with pkg-config)
+- Boost 1.89.0 exactly (url, program_options, chrono, thread, filesystem, log) — located via CMake
+- gRPC++ ≥1.74.1
 - Protocol Buffers (searched in `/usr/local/lib64`, `/usr/local/lib`, `/usr/lib64`, `/usr/lib`)
 - Abseil (`absl_synchronization`, `absl_time`) — same search paths
 - GLib 2.0

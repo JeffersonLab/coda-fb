@@ -1129,7 +1129,9 @@ int main(int argc, char **argv)
         // Configure reassembler
         Reassembler::ReassemblerFlags rflags;
         rflags.useCP = withCP;
-        rflags.withLBHeader = !withCP;
+        // E2SAR >=0.4.0 removed ReassemblerFlags::withLBHeader and derives the
+        // equivalent internally as (not rflags.useCP), which is exactly what we
+        // used to set here, so the behaviour is unchanged.
         rflags.rcvSocketBufSize = sockBufSize;
         rflags.useHostAddress = preferV6;
         // Only set validateCert when actually using control plane (SSL/TLS context)

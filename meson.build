@@ -38,7 +38,7 @@ glib_dep = dependency('glib-2.0', required: true)
 # Protobuf and gRPC dependencies
 # Note: E2SAR may be built with a specific protobuf version in /usr/local
 # We need to ensure we link against the same version
-grpc_dep = dependency('grpc++', version: '>=1.51.1', required: true)
+grpc_dep = dependency('grpc++', version: '>=1.74.1', required: true)
 
 # Find protobuf - prefer /usr/local version to match E2SAR
 protobuf_lib = compiler.find_library('protobuf', dirs: ['/usr/local/lib64', '/usr/local/lib', '/usr/lib64', '/usr/lib'], required: true)
@@ -79,18 +79,15 @@ if not et_dep.found()
 endif
 
 # Boost dependencies - via CMake (uses BoostConfig.cmake)
+# Module list and version mirror E2SAR 0.4.0's own meson.build: it pins Boost to
+# exactly 1.89.0, dropped 'system' (header-only since 1.69) and added 'log',
+# which E2SAR now links against. Both come from the e2sar-deps bundle.
 boost_dep = dependency('boost',
-    modules: ['system', 'program_options', 'chrono', 'thread', 'filesystem', 'url'],  # <-- add 'url'
+    modules: ['url', 'program_options', 'chrono', 'thread', 'filesystem', 'log'],
     method: 'cmake',
-    version: ['>=1.83.0', '<=1.86.0'],
+    version: ['>=1.89.0', '<=1.89.0'],
     required: true)
 
-# Boost dependencies - using cmake method since boost doesn't always provide .pc files
-#boost_dep = dependency('boost', 
-#    modules: ['system', 'program_options', 'chrono', 'thread', 'filesystem'], 
-#    method: 'cmake',
-#    version: ['>=1.83.0', '<=1.86.0'],
-#    required: true)
 
 # Optional dependencies for enhanced features
 numa_code = '''
