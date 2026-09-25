@@ -43,6 +43,7 @@ RUN apt-get -yq update && apt-get -yq install --no-install-recommends \
         wget \
         ca-certificates \
         python3-pip \
+        python3-dev \
         protobuf-compiler \
         libglib2.0-dev \
         libssl-dev \
@@ -52,6 +53,11 @@ RUN apt-get -yq update && apt-get -yq install --no-install-recommends \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# E2SAR unconditionally builds its pybind11 bindings (src/meson.build does a
+# plain subdir('pybind') with no option to disable it), so the Python
+# development files and pybind11 headers are build requirements even though
+# coda-fb only consumes the C++ library. Without python3-dev, meson fails at
+# src/pybind/meson.build with "Python dependency not found".
 RUN pip3 install --no-cache-dir meson pybind11
 
 # coda-fb's meson.build adds -L/usr/local/lib64 and an rpath entry for it.
