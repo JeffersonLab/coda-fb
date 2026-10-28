@@ -102,6 +102,50 @@ consume the next argument).
 `--recv-ejfat-uri` is the **instance URI** of the load balancer to receive from (the one returned
 when it was reserved). It replaces `--uri`/`-u`; see [Migrating from `--uri`](#migrating-from---uri).
 
+#### Output options
+
+Where the data goes depends on the mode.
+
+**Reassembly-only mode** (default, `--enable-framebuild=0`) has a single output: every event
+reassembled from the receive LB is appended, as raw bytes, to one file
+`<--output-dir>/<--prefix><--extension>` (default `events.bin`). No frames are built, and ET and
+LB forwarding are not available in this mode.
+
+**Frame-building mode** (`--enable-framebuild=1`) has three outputs for the built EVIO-6 frames.
+Any combination can be enabled, and at least one is required:
+
+| Output | Enabled by | What it produces |
+|---|---|---|
+| **Second EJFAT load balancer** | `--send-ejfat-uri` | Each frame sent as one E2SAR event, fragmented into UDP packets for LB #2. See [Forwarding built frames](#forwarding-built-frames-to-a-second-load-balancer). |
+| **ET system** | `--et-file` (with `--et-host`, `--et-port`) | Each frame put into one ET event at the GRAND_CENTRAL station. |
+| **EVIO file** | `--fb-output-dir` | `.evio` files: a 56-byte EVIO-6 file header, then the frames back to back; one file series per builder thread, `<prefix>_thread<N>_file<MMMM>.evio`, rolling over at 2 GB. |
+
+All three receive exactly the same frame bytes; they share one buffer, so nothing is copied. For
+each frame the order is: forward to the LB first (an asynchronous hand-off, so the frame leaves as
+soon as it is built), then ET, then file. A failure in one output does not stop the others; it is
+counted per output.
+
+The outputs differ in a few ways:
+
+- **Partial frames** (a stream still missing after `--frame-timeout`) always go to ET and file;
+  they go to the LB only with `--send-partial-frames=1` (the default).
+- **At shutdown**, a frame that has just been built is still forwarded to the LB, while ET and
+  file output skip it once shutdown has begun.
+- **Backpressure** applies only to the LB output: an in-flight limit (`--send-queue-frames`,
+  `--send-queue-bytes`) with a `block` or `drop` policy (`--send-overflow`). ET and file writes
+  happen directly in the builder thread.
+
+> **ET gates all frame building.** If the ET library is not found at build time, frame-building
+> mode is not compiled in at all, so the EVIO file output and LB forwarding are unavailable too;
+> only reassembly-only mode remains. The Docker image always includes ET. See
+> [Dependencies](#dependencies).
+
+Not data outputs: the periodic **statistics report** on stdout (`--report-interval`) and the
+**Prometheus `/metrics` endpoint** (`--metrics-port`, see [Statistics](#statistics)) carry
+counters only, never frame data.
+
+#### Examples
+
 **Reassembly-only (default): raw frames concatenated into one file**
 ```bash
 coda-fb --recv-ejfat-uri 'ejfats://token@host:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \
