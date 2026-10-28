@@ -19,3 +19,6 @@ builddir/
 .ninja_deps
 .ninja_log
 compile_commands.json
+
+# macOS Finder metadata
+.DS_Store
