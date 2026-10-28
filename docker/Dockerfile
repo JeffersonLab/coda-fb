@@ -135,6 +135,8 @@ ARG CODA_FB_BUILDTYPE=release
 
 COPY meson.build meson_options.txt /src/coda-fb/
 COPY src/ /src/coda-fb/src/
+# meson.build includes test/ (tests are declared but not built by default)
+COPY test/ /src/coda-fb/test/
 
 # coda-fb's meson.build treats a prefix of exactly /usr/local as "no prefix
 # given" and then falls back to $CODA/Linux-x86_64/bin, or to $HOME/.local/bin

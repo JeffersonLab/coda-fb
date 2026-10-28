@@ -1,0 +1,51 @@
+# Prometheus + Grafana for coda-fb (doc/monitoring.md, section 6).
+#
+#   cd doc/monitoring/stack
+#   $EDITOR prometheus.yml            # list your coda-fb hosts:ports
+#   docker compose up -d
+#   open http://<this host>:3000      # dashboard "coda-fb pipeline"
+#   docker compose down               # add -v to also delete stored metrics
+#
+# Host networking so Prometheus reaches coda-fb on localhost as well as on
+# other hosts, and Grafana reaches Prometheus on localhost:9090. This is for
+# Linux hosts; Docker Desktop (macOS/Windows) host networking does not expose
+# ports to the desktop, see section 6 for a bridge-network variant.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: coda-fb-prometheus
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      # PROMETHEUS_LISTEN=127.0.0.1:9090 to reach it only from this host (e.g. via ssh -L)
+      - --web.listen-address=${PROMETHEUS_LISTEN:-:9090}
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../coda-fb-alerts.yml:/etc/prometheus/coda-fb-alerts.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: coda-fb-grafana
+    network_mode: host
+    environment:
+      GF_SERVER_HTTP_PORT: "3000"
+      # GRAFANA_LISTEN_ADDR=127.0.0.1 to reach it only from this host (e.g. via ssh -L)
+      GF_SERVER_HTTP_ADDR: ${GRAFANA_LISTEN_ADDR:-}
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # open the coda-fb dashboard instead of the Grafana home page
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/coda-fb/grafana-dashboard.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana-dashboard.json:/var/lib/grafana/dashboards/coda-fb/grafana-dashboard.json:ro
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

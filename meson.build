@@ -141,7 +141,14 @@ add_project_arguments('-DCODA_FB_VERSION="' + meson.project_version() + '"',
 warning_level = 1
 
 # Source files
-receiver_sources = ['src/coda-fb.cpp']
+# Forwarding to a second EJFAT LB (frame_sender, e2sar_frame_transport) is
+# compiled unconditionally but only used when the frame builder is enabled.
+receiver_sources = ['src/coda-fb.cpp',
+                    'src/ejfat_uri_config.cpp',
+                    'src/frame_sender.cpp',
+                    'src/e2sar_frame_transport.cpp',
+                    'src/metrics_render.cpp',
+                    'src/metrics_endpoint.cpp']
 
 # Add frame builder if ET is available
 if et_dep.found()
@@ -183,7 +190,7 @@ endif
 
 if use_absolute_install
     # Use absolute path for CODA or ~/.local installation
-    executable('coda-fb',
+    coda_fb_exe = executable('coda-fb',
         receiver_sources,
         dependencies: receiver_deps,
         link_args: linker_flags,
@@ -191,7 +198,7 @@ if use_absolute_install
         install_dir: install_bin_dir)
 else
     # Use default meson behavior (prefix + bindir)
-    executable('coda-fb',
+    coda_fb_exe = executable('coda-fb',
         receiver_sources,
         dependencies: receiver_deps,
         link_args: linker_flags,
@@ -211,6 +218,10 @@ else
         parser_sources,
         install: true)
 endif
+
+# Tests: 'meson test -C builddir' builds and runs them; they are not built by
+# default and not installed. See test/README.md.
+subdir('test')
 
 # Summary
 summary({

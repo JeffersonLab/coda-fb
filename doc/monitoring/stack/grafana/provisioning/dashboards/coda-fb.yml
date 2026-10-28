@@ -1,0 +1,9 @@
+# Load ../grafana-dashboard.json into a "coda-fb" folder at Grafana startup.
+apiVersion: 1
+providers:
+  - name: coda-fb
+    folder: coda-fb
+    type: file
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/coda-fb

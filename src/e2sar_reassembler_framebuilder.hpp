@@ -19,6 +19,11 @@
 #include <memory>
 #include <et.h>
 
+namespace codafb {
+class FrameSender;
+struct FrameBuildStats;
+}
+
 namespace e2sar {
 
 // Forward declarations
@@ -65,8 +70,16 @@ private:
     int builderThreadCount;
     std::vector<std::unique_ptr<BuilderThread>> builderThreads;
 
+    // Forwarding of built frames to a second EJFAT LB (optional, not owned)
+    codafb::FrameSender* frameSender{nullptr};
+    bool forwardPartialFrames{true};
+
+    // Pipeline statistics (optional, not owned)
+    codafb::FrameBuildStats* buildStats{nullptr};
+
     // Global control
     std::atomic<bool> running{false};
+    bool allJoined{true};
 
     // Statistics (aggregated from all threads)
     std::atomic<uint64_t> framesBuilt{0};
@@ -107,10 +120,11 @@ public:
      * @param expectedStreams Number of expected data streams per frame number
      * @param verbose Enable verbose logging of frame building progress (default: false)
      *
-     * Note: At least one output mode (ET or file) must be enabled.
+     * Note: At least one output must be enabled by the time start() is called.
      *       - To enable ET output: provide valid etFile and stationName
      *       - To enable file output: provide valid fileDir
-     *       - Both can be enabled simultaneously for dual output
+     *       - To forward frames to a second EJFAT LB: call setFrameSender()
+     *       - Any combination can be enabled simultaneously
      */
     FrameBuilder(const std::string& etFile,
                  const std::string& etHost,
@@ -148,6 +162,24 @@ public:
                       uint8_t* data, size_t dataLen);
 
     /**
+     * Forward every built frame to 'sender' as soon as it is serialized,
+     * before ET and file output. The same buffer is shared with ET/file
+     * output, so no copy is made. Must be called before start(). 'sender'
+     * must outlive the builder threads.
+     *
+     * @param sender         Frame sender (nullptr disables forwarding)
+     * @param forwardPartial Also forward partial frames (fewer streams than
+     *                       expected); ET/file output always receives them.
+     */
+    void setFrameSender(codafb::FrameSender* sender, bool forwardPartial = true);
+
+    /**
+     * Record frame-building statistics into 'stats'. Must be called before
+     * start(); 'stats' must outlive the builder threads.
+     */
+    void setStatistics(codafb::FrameBuildStats* stats);
+
+    /**
      * Start the frame builder and all builder threads
      *
      * Initializes ET connection, creates multiple attachments,
@@ -160,10 +192,21 @@ public:
     /**
      * Stop the frame builder and all builder threads
      *
-     * Stops all builder threads, aggregates statistics,
-     * and closes ET connection.
+     * Stops all builder threads, aggregates statistics, and closes the ET
+     * connection. A thread that is busy finishes its current frame (which
+     * includes handing it to the frame sender, bounded by the sender's
+     * shutdown deadline). Threads that have not exited within joinTimeoutMs
+     * are detached; see allThreadsJoined().
+     *
+     * @param joinTimeoutMs How long to wait for all threads to exit
      */
-    void stop();
+    void stop(int joinTimeoutMs = 1000);
+
+    /**
+     * True if every builder thread exited and was joined by stop(). If false,
+     * objects the threads use (ET, the frame sender) must not be destroyed.
+     */
+    bool allThreadsJoined() const { return allJoined; }
 
     /**
      * Print aggregated statistics from all builder threads
@@ -173,10 +216,10 @@ public:
     /**
      * Get current aggregated statistics
      *
-     * @param built Total frames built across all threads
-     * @param slices Total slices aggregated across all threads
-     * @param errors Total build errors across all threads
-     * @param bytes Total bytes written across all threads
+     * @param built Total frames delivered to every enabled output
+     * @param slices Total slices aggregated
+     * @param errors Total build and output errors across all threads
+     * @param bytes Total bytes of the frames counted in 'built'
      */
     void getStatistics(uint64_t& built, uint64_t& slices, uint64_t& errors, uint64_t& bytes) const;
 

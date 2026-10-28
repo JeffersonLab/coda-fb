@@ -1,5 +1,5 @@
 # Build context for docker/Dockerfile is the repository root.
-# Only meson.build, meson_options.txt, src/ and docker/ are actually needed.
+# Only meson.build, meson_options.txt, src/, test/ and docker/ are actually needed.
 
 .git
 .gitignore

@@ -1,0 +1,30 @@
+# Example Prometheus configuration for coda-fb (see ../monitoring.md).
+# Start coda-fb with --metrics-port 9465 --metrics-bind 0.0.0.0 (or the host
+# address) so it can be scraped from the Prometheus host. Adjust hosts and labels.
+
+global:
+  scrape_interval: 15s       # 5s is reasonable during commissioning
+  evaluation_interval: 15s
+
+rule_files:
+  - coda-fb-alerts.yml
+
+scrape_configs:
+  # Long-running DAQ hosts: one target per coda-fb instance (--metrics-port).
+  - job_name: coda-fb
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['daq-fb1.example.org:9465', 'daq-fb2.example.org:9465']
+        labels:
+          role: frame-builder
+          lb_pair: hallb-1          # static, bounded label: which LB #1 -> LB #2 pair
+    # Never relabel URIs, tokens or LB ids into labels.
+
+  # Batch jobs (e.g. Perlmutter): the job script writes its node and port into a
+  # file_sd JSON file that Prometheus watches, e.g.
+  #   [{"targets": ["nid001234:9465"], "labels": {"slurm_job": "123456"}}]
+  # slurm_job is bounded per job, not per frame/event.
+  - job_name: coda-fb-batch
+    file_sd_configs:
+      - files: ['/etc/prometheus/coda-fb-targets/*.json']
+        refresh_interval: 30s

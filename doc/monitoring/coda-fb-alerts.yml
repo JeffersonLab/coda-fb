@@ -1,0 +1,97 @@
+# Example alert rules for coda-fb (metric names from ../monitoring.md).
+# Thresholds are starting points; tune them to the run conditions.
+
+groups:
+  - name: coda-fb
+    rules:
+      # ---- availability ------------------------------------------------------------
+      - alert: CodaFbDown
+        expr: up{job=~"coda-fb.*"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }} cannot be scraped"
+          description: "Process down, or the metrics endpoint is unreachable."
+
+      - alert: CodaFbStageNotReady
+        expr: coda_fb_ready == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }}: {{ $labels.stage }} not ready"
+
+      # ---- backpressure ------------------------------------------------------------
+      - alert: CodaFbSendQueueSaturated
+        expr: |
+          (coda_fb_send_inflight_frames / coda_fb_send_capacity_frames > 0.9)
+          or (coda_fb_send_inflight_bytes / coda_fb_send_capacity_bytes > 0.9)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }}: send queue >90% full for 5m"
+          description: "Forwarding to the second LB is not keeping up."
+
+      - alert: CodaFbBuildersBlocked
+        expr: rate(coda_fb_send_blocked_seconds_total[5m]) > 0.5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }}: builders blocked on sending >50% of the time"
+          description: "Upstream losses on the receive LB (enqueue_full) will follow."
+
+      # ---- losses, errors, drops ----------------------------------------------------
+      - alert: CodaFbFramesDropped
+        expr: increase(coda_fb_send_frames_total{outcome=~"dropped_overflow|rejected"}[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }}: {{ $labels.outcome }} frames in the last 5m"
+
+      - alert: CodaFbSendPacketErrors
+        expr: rate(coda_fb_send_packet_errors_total[5m]) > 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }}: E2SAR packet send errors"
+
+      - alert: CodaFbReceiveLosses
+        expr: |
+          sum by (instance) (rate(coda_fb_recv_events_lost_total[5m]))
+            / sum by (instance) (rate(coda_fb_recv_events_reassembled_total[5m])) > 0.001
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }}: >0.1% of events lost on receive"
+
+      - alert: CodaFbBuildFailures
+        expr: increase(coda_fb_build_frames_total{outcome="build_failed"}[5m]) > 0
+           or increase(coda_fb_build_output_errors_total[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }}: frames failing to build or to be written"
+
+      # ---- no progress while traffic is expected -----------------------------------
+      - alert: CodaFbNotBuilding
+        expr: |
+          rate(coda_fb_recv_events_total[2m]) > 0
+          and on (instance) (timestamp(coda_fb_last_activity_timestamp_seconds{stage="built"}) - coda_fb_last_activity_timestamp_seconds{stage="built"}) > 30
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }} receives events but has built no frame for 30s"
+
+      - alert: CodaFbNotForwarding
+        expr: |
+          rate(coda_fb_build_frames_total{outcome=~"complete|partial"}[2m]) > 0
+          and on (instance) (timestamp(coda_fb_last_activity_timestamp_seconds{stage="released"}) - coda_fb_last_activity_timestamp_seconds{stage="released"}) > 30
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }} builds frames but E2SAR released none for 30s"
+
+      # Requires knowing that beam/traffic is on; silence during beam-off.
+      - alert: CodaFbNoInput
+        expr: rate(coda_fb_recv_udp_packets_total[5m]) == 0 and on (instance) coda_fb_ready{stage="receiver"} == 1
+        for: 10m
+        labels: {severity: info}
+        annotations:
+          summary: "coda-fb {{ $labels.instance }}: no UDP input for 10m"

@@ -48,6 +48,13 @@
  * - Lock released during expensive build/send operations
  * - Event number distribution ensures same event goes to same builder thread
  *
+ * OUTPUT ORDER PER BUILT FRAME:
+ * 1. Forward to the second EJFAT LB via FrameSender (if enabled). This is an
+ *    asynchronous enqueue, so the frame leaves as soon as it is serialized.
+ * 2. ET, then file output (if enabled).
+ * All outputs share one immutable buffer; it is freed when the last of them
+ * (normally E2SAR's send callback) drops its reference.
+ *
  * Multi-threaded design based on EMU PAGG (Primary Aggregator):
  * - Multiple parallel builder threads for high throughput
  * - Lock-free frame distribution across threads by event number hash
@@ -58,6 +65,8 @@
  */
 
 #include "e2sar_reassembler_framebuilder.hpp"
+#include "frame_sender.hpp"
+#include "pipeline_stats.hpp"
 #include <et.h>
 #include <iostream>
 #include <iomanip>
@@ -204,20 +213,35 @@ private:
     int expectedStreamCount;   // Number of expected data streams per frame number
     bool verboseLogging;       // Enable verbose logging of frame building progress
 
-    // Statistics (thread-local, no contention)
-    uint64_t framesBuilt{0};
-    uint64_t slicesProcessed{0};
-    uint64_t buildErrors{0};
-    uint64_t frameNumberErrors{0};
-    uint64_t filesCreated{0};
-    uint64_t bytesWritten{0};
+    // Forwarding to a second EJFAT LB and pipeline statistics (optional, not owned)
+    codafb::FrameSender* sender;
+    bool forwardPartial;
+    codafb::FrameBuildStats* stats;
+
+    // Exit handshake so stop() can join instead of guessing
+    std::mutex exitMutex;
+    std::condition_variable exitCV;
+    bool exited{false};
+
+    // Statistics. Written only by this thread (and addTimeSlice() under frameMutex),
+    // read by the statistics reporting thread, hence atomic.
+    std::atomic<uint64_t> framesBuilt{0};      // delivered to every enabled output
+    std::atomic<uint64_t> bytesDelivered{0};   // bytes of those frames
+    std::atomic<uint64_t> recordsBuilt{0};     // successfully serialized; drives the EVIO record number
+    std::atomic<uint64_t> slicesProcessed{0};
+    std::atomic<uint64_t> buildErrors{0};
+    std::atomic<uint64_t> frameNumberErrors{0};
+    std::atomic<uint64_t> filesCreated{0};
+    std::atomic<uint64_t> bytesWritten{0};     // bytes written to files
 
 public:
     BuilderThread(int index, int count, et_sys_id sys, et_att_id att,
                   int fnSlop, int timeout, int evtSize,
                   bool enableET, bool enableFile,
                   const std::string& fileDir, const std::string& filePrefix,
-                  int numExpectedStreams, bool verbose)
+                  int numExpectedStreams, bool verbose,
+                  codafb::FrameSender* frameSender, bool sendPartial,
+                  codafb::FrameBuildStats* buildStats)
         : threadIndex(index)
         , threadCount(count)
         , etSystem(sys)
@@ -234,6 +258,9 @@ public:
         , etEventSize(evtSize)
         , expectedStreamCount(numExpectedStreams)
         , verboseLogging(verbose)
+        , sender(frameSender)
+        , forwardPartial(sendPartial)
+        , stats(buildStats)
     {
         threadName = "Builder-" + std::to_string(index);
     }
@@ -411,11 +438,13 @@ public:
         // Track first arrival time for this corrected event number (for timeout)
         if (frameArrivalTimes.find(trackingEventNum) == frameArrivalTimes.end()) {
             frameArrivalTimes[trackingEventNum] = std::chrono::steady_clock::now();
+            if (stats) stats->framesInProgress.add(1);
         }
 
         // Enqueue slice to its stream's FIFO
         streamFIFOs[streamId].push(std::move(slice));
         slicesProcessed++;
+        if (stats) stats->slicesPending.add(1);
 
         // Signal builder thread
         frameCV.notify_one();
@@ -491,7 +520,7 @@ public:
         std::vector<uint32_t> eventWords;
 
         eventWords.push_back(0);  // Word 0: recordLength (filled later)
-        eventWords.push_back(framesBuilt + 1);  // Word 1: recordNumber (1-indexed count of successfully built frames)
+        eventWords.push_back(recordsBuilt + 1);  // Word 1: recordNumber (1-indexed count of successfully built frames, per thread)
         eventWords.push_back(14); // Word 2: headerLength (always 14 for EVIO-6)
         eventWords.push_back(1);  // Word 3: eventIndexCount (1 event per record)
         eventWords.push_back(0);  // Word 4: indexArrayLength (0 = no index)
@@ -732,8 +761,8 @@ public:
             return false;
         }
 
-        framesBuilt++;
-        bytesWritten += frameData.size();
+        // framesBuilt is counted once per frame by the caller; counting it here
+        // as well used to double the frame count whenever ET output was enabled.
         return true;
     }
 
@@ -786,6 +815,18 @@ public:
         }
 
         return {allAligned, alignedStreams};
+    }
+
+    /**
+     * True if any stream FIFO currently starts with this corrected event number.
+     * NOTE: Caller must hold frameMutex
+     */
+    bool anyFifoHeadHas(uint32_t correctedEventNum) {
+        for (const auto& [streamId, fifo] : streamFIFOs) {
+            if (!fifo.empty() && getCorrectedEventNum(streamId, fifo.front().frameNumber) == correctedEventNum)
+                return true;
+        }
+        return false;
     }
 
     /**
@@ -854,6 +895,27 @@ public:
                           << ", Corrected=" << (streamEventNum + correction) << std::endl;
             }
         }
+
+        // Arrival times so far are keyed by RAW event number. Re-key them by
+        // corrected number (keeping the earliest arrival) so that timeouts and
+        // in-progress tracking use the same numbers as frame building does;
+        // otherwise the raw-keyed startup entries are never cleaned up.
+        std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> rekeyed;
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& [streamId, fifo] : streamFIFOs) {
+            for (size_t i = 0, n = fifo.size(); i < n; i++) {
+                TimeSlice slice = std::move(fifo.front());
+                fifo.pop();
+                auto raw = frameArrivalTimes.find(slice.frameNumber);
+                auto arrived = (raw != frameArrivalTimes.end()) ? raw->second : now;
+                auto [it, inserted] = rekeyed.emplace(getCorrectedEventNum(streamId, slice.frameNumber), arrived);
+                if (!inserted && arrived < it->second) it->second = arrived;
+                fifo.push(std::move(slice));
+            }
+        }
+        if (stats) stats->framesInProgress.add(static_cast<int64_t>(rekeyed.size()) -
+                                               static_cast<int64_t>(frameArrivalTimes.size()));
+        frameArrivalTimes.swap(rekeyed);
 
         correctionFactorsInitialized = true;
         std::cout << "[" << threadName << "] Correction factors initialized (fixed for this run)" << std::endl;
@@ -986,10 +1048,19 @@ public:
                 }
             }
 
-            // Clean up timeout tracking for this corrected event number if all streams consumed it
-            if (allAligned) {
-                frameArrivalTimes.erase(minCorrectedEventNum);
+            // First arrival of any slice of this frame, for the assembly latency
+            auto arrivalIt = frameArrivalTimes.find(minCorrectedEventNum);
+            const auto firstArrival = (arrivalIt != frameArrivalTimes.end())
+                                      ? arrivalIt->second : std::chrono::steady_clock::now();
+
+            // Stop tracking this corrected event number once no FIFO still starts
+            // with it. (This used to happen only when aligned, which leaked one
+            // entry per partial frame built from lagging streams.)
+            if (arrivalIt != frameArrivalTimes.end() && !anyFifoHeadHas(minCorrectedEventNum)) {
+                frameArrivalTimes.erase(arrivalIt);
+                if (stats) stats->framesInProgress.add(-1);
             }
+            if (stats) stats->slicesPending.add(-static_cast<int64_t>(aggregatedFrame.slices.size()));
 
             // Release lock before expensive build/send operations
             lock.unlock();
@@ -1013,14 +1084,45 @@ public:
 
             // Check if we should stop before expensive operations
             if (!running) {
+                if (stats) {
+                    stats->framesDiscardedShutdown.add();
+                    stats->slicesDiscardedShutdown.add(aggregatedFrame.slices.size());
+                }
                 lock.lock();
                 break;
             }
 
-            // Step 6: Build EVIO-6 frame
-            std::vector<uint8_t> builtFrame;
-            if (buildEVIO6Frame(aggregatedFrame, builtFrame)) {
+            // Step 6: Build EVIO-6 frame into a buffer shared by all outputs
+            auto builtFrame = std::make_shared<std::vector<uint8_t>>();
+            const auto buildStart = std::chrono::steady_clock::now();
+            if (buildEVIO6Frame(aggregatedFrame, *builtFrame)) {
+                const auto buildEnd = std::chrono::steady_clock::now();
+                recordsBuilt++;
+                if (stats) {
+                    (isComplete ? stats->framesComplete : stats->framesPartial).add();
+                    stats->bytesSerialized.add(builtFrame->size());
+                    stats->frameBytes.observe(builtFrame->size());
+                    stats->serializeNs.observe(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(buildEnd - buildStart).count()));
+                    stats->assemblyNs.observe(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(buildEnd - firstArrival).count()));
+                    stats->lastFrame.mark();
+                }
                 bool success = true;
+
+                // Forward first: it is a non-blocking enqueue unless the send
+                // queue is full, and it is done even when stopping, so a frame
+                // that was completed is not silently discarded. The sender bounds
+                // any wait by its shutdown deadline.
+                if (sender) {
+                    if (isComplete || forwardPartial) {
+                        codafb::FrameBuffer shared = builtFrame;
+                        success = (sender->submit(std::move(shared), minCorrectedEventNum) ==
+                                   codafb::FrameSender::Outcome::Submitted) && success;
+                    } else {
+                        sender->countSkippedPartial();
+                    }
+                }
 
                 // Check if we should stop before ET/file operations
                 if (!running) {
@@ -1030,7 +1132,9 @@ public:
 
                 // Send to ET if enabled
                 if (useET && running) {
-                    success = sendToET(builtFrame) && success;
+                    bool ok = sendToET(*builtFrame);
+                    if (!ok && stats) stats->etOutputErrors.add();
+                    success = ok && success;
 
                     // Check again after potentially blocking ET call
                     if (!running) {
@@ -1041,12 +1145,17 @@ public:
 
                 // Write to file if enabled
                 if (useFileOutput && running) {
-                    success = writeToFile(builtFrame) && success;
+                    bool ok = writeToFile(*builtFrame);
+                    if (!ok && stats) stats->fileOutputErrors.add();
+                    success = ok && success;
                 }
 
                 if (success) {
                     framesBuilt++;
+                    bytesDelivered += builtFrame->size();
                 }
+            } else if (stats) {
+                stats->framesBuildFailed.add();
             }
 
             // Reacquire lock for next iteration
@@ -1054,6 +1163,10 @@ public:
         }
 
         std::cout << "[" << threadName << "] Builder thread stopped" << std::endl;
+
+        std::lock_guard<std::mutex> exitLock(exitMutex);
+        exited = true;
+        exitCV.notify_all();
     }
 
     /**
@@ -1068,61 +1181,79 @@ public:
      * Signal the thread to stop (non-blocking)
      */
     void signalStop() {
+        // Setting the flag under frameMutex means the builder either sees it
+        // before it waits or is already waiting and gets the notification, so
+        // one notify is enough.
+        std::lock_guard<std::mutex> lock(frameMutex);
         running = false;
-
-        // Notify aggressively - call multiple times with small delays
-        // to ensure the thread wakes up even if it's in the middle of a wait_for timeout
-        for (int i = 0; i < 5; i++) {
-            frameCV.notify_all();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
+        frameCV.notify_all();
     }
 
     /**
-     * Wait for the thread to finish (with timeout and detach fallback)
+     * Wait until 'deadline' for the thread to exit, then join it. If it has
+     * not exited by then, detach it (it may be blocked in an ET call).
+     *
+     * @return true if the thread was joined
      */
-    void waitForStop() {
+    bool waitForStop(std::chrono::steady_clock::time_point deadline) {
         if (!thread.joinable()) {
-            return;
+            return true;
         }
 
-        // Give thread up to 1 second to finish current operation and exit
-        // We can't truly "timeout" on join(), so we wait then detach as fallback
-        auto start = std::chrono::steady_clock::now();
-        const int max_wait_ms = 1000;
+        bool done;
+        {
+            std::unique_lock<std::mutex> exitLock(exitMutex);
+            done = exitCV.wait_until(exitLock, deadline, [this] { return exited; });
+        }
+        if (done) {
+            thread.join();
+            return true;
+        }
+        std::cerr << "[" << threadName << "] WARNING: did not exit in time, detaching" << std::endl;
+        thread.detach();
+        return false;
+    }
 
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start);
-
-            if (elapsed.count() > max_wait_ms) {
-                // Timeout - detach and let OS clean up
-                thread.detach();
-                return;
+    /**
+     * Count the slices still queued after the thread exited as discarded at
+     * shutdown, and release them. Call only after waitForStop() returned true.
+     */
+    void discardPending() {
+        std::lock_guard<std::mutex> lock(frameMutex);
+        std::unordered_map<uint32_t, bool> frames;
+        size_t slices = 0;
+        for (auto& [streamId, fifo] : streamFIFOs) {
+            while (!fifo.empty()) {
+                frames[getCorrectedEventNum(streamId, fifo.front().frameNumber)] = true;
+                fifo.pop();
+                slices++;
             }
         }
-    }
-
-    /**
-     * Stop the builder thread (calls both signal and wait)
-     */
-    void stop() {
-        signalStop();
-        waitForStop();
+        if (stats) {
+            stats->framesDiscardedShutdown.add(frames.size());
+            stats->slicesDiscardedShutdown.add(slices);
+            stats->slicesPending.add(-static_cast<int64_t>(slices));
+            stats->framesInProgress.add(-static_cast<int64_t>(frameArrivalTimes.size()));
+        }
+        frameArrivalTimes.clear();
+        if (slices > 0) {
+            std::cout << "[" << threadName << "] Discarded " << slices << " queued slice(s) of "
+                      << frames.size() << " unbuilt frame(s) at shutdown" << std::endl;
+        }
     }
 
     /**
      * Get statistics
      */
     void getStats(uint64_t& built, uint64_t& slices, uint64_t& errors, uint64_t& fnErrors,
-                  uint64_t& files, uint64_t& bytes) const {
+                  uint64_t& files, uint64_t& bytes, uint64_t& delivered) const {
         built = framesBuilt;
         slices = slicesProcessed;
         errors = buildErrors;
         fnErrors = frameNumberErrors;
         files = filesCreated;
         bytes = bytesWritten;
+        delivered = bytesDelivered;
     }
 
     bool isRunning() const { return running; }
@@ -1172,12 +1303,17 @@ FrameBuilder::FrameBuilder(const std::string& etFile,
     std::cout << std::endl;
     std::cout << "  Expected streams: " << expectedStreams << std::endl;
     std::cout << "  Frame timeout: " << frameTimeoutMs << " ms" << std::endl;
+    // At least one output must be enabled; checked in start(), because
+    // forwarding is attached with setFrameSender() after construction.
+}
 
-    // Validate that at least one output is enabled
-    if (!enableET && !enableFileOutput) {
-        std::cerr << "ERROR: At least one output (ET or file) must be enabled" << std::endl;
-        throw std::invalid_argument("No output enabled");
-    }
+void FrameBuilder::setFrameSender(codafb::FrameSender* sender, bool forwardPartial) {
+    frameSender = sender;
+    forwardPartialFrames = forwardPartial;
+}
+
+void FrameBuilder::setStatistics(codafb::FrameBuildStats* stats) {
+    buildStats = stats;
 }
 
 /**
@@ -1319,12 +1455,18 @@ void FrameBuilder::addTimeSlice(uint64_t timestamp, uint32_t frameNumber, uint16
     // Send to appropriate builder thread's per-stream FIFO (move to avoid copy)
     builderThreads[threadIndex]->addTimeSlice(std::move(slice));
     slicesAggregated++;
+    if (buildStats) buildStats->slicesIn.add();
 }
 
 /**
  * Start all builder threads
  */
 bool FrameBuilder::start() {
+    if (!enableET && !enableFileOutput && frameSender == nullptr) {
+        std::cerr << "ERROR: At least one frame builder output (ET, file or forwarding) must be enabled" << std::endl;
+        return false;
+    }
+
     // Initialize ET system if enabled
     if (enableET) {
         if (!initializeET()) {
@@ -1358,6 +1500,10 @@ bool FrameBuilder::start() {
         std::cout << "  File output: enabled (dir: " << fileOutputDir
                   << ", prefix: " << fileOutputPrefix << ")" << std::endl;
     }
+    if (frameSender) {
+        std::cout << "  Forwarding: enabled (" << (forwardPartialFrames ? "complete and partial" : "complete only")
+                  << " frames)" << std::endl;
+    }
 
     // Create and start builder threads
     for (int i = 0; i < builderThreadCount; i++) {
@@ -1376,7 +1522,10 @@ bool FrameBuilder::start() {
             fileOutputDir,
             fileOutputPrefix,
             expectedStreams,
-            verbose
+            verbose,
+            frameSender,
+            forwardPartialFrames,
+            buildStats
         );
         builder->start();
         builderThreads.push_back(std::move(builder));
@@ -1390,7 +1539,7 @@ bool FrameBuilder::start() {
 /**
  * Stop all builder threads
  */
-void FrameBuilder::stop() {
+void FrameBuilder::stop(int joinTimeoutMs) {
     std::cout << "Stopping frame builder..." << std::endl;
 
     running = false;
@@ -1400,12 +1549,23 @@ void FrameBuilder::stop() {
         builder->signalStop();
     }
 
-    // Then, wait for all threads to finish
+    // Then, wait for all threads to finish, sharing one deadline
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(joinTimeoutMs);
+    allJoined = true;
     for (auto& builder : builderThreads) {
-        builder->waitForStop();
+        if (builder->waitForStop(deadline)) {
+            builder->discardPending();
+        } else {
+            allJoined = false;
+        }
     }
 
-    std::cout << "All builder threads finished" << std::endl;
+    if (allJoined) {
+        std::cout << "All builder threads finished" << std::endl;
+    } else {
+        std::cerr << "WARNING: some builder threads did not exit within " << joinTimeoutMs
+                  << " ms and were detached" << std::endl;
+    }
 
     // Collect statistics from all threads
     framesBuilt = 0;
@@ -1417,8 +1577,8 @@ void FrameBuilder::stop() {
     std::cout << "Collecting statistics..." << std::endl;
 
     for (auto& builder : builderThreads) {
-        uint64_t built, slices, errors, fnErrors, files, bytes;
-        builder->getStats(built, slices, errors, fnErrors, files, bytes);
+        uint64_t built, slices, errors, fnErrors, files, bytes, delivered;
+        builder->getStats(built, slices, errors, fnErrors, files, bytes, delivered);
         framesBuilt += built;
         buildErrors += errors;
         frameNumberErrors += fnErrors;
@@ -1435,8 +1595,9 @@ void FrameBuilder::stop() {
     // will handle cleanup when the object is destroyed at program exit.
     // builderThreads.clear();
 
-    // Detach and close ET if enabled
-    if (enableET && etSystem) {
+    // Detach and close ET if enabled. A detached builder thread may still be
+    // inside an ET call, so in that case ET is left open for process exit.
+    if (enableET && etSystem && allJoined) {
         for (auto attachment : etAttachments) {
             et_station_detach(etSystem, attachment);
         }
@@ -1484,21 +1645,21 @@ void FrameBuilder::printStatistics() const {
 void FrameBuilder::getStatistics(uint64_t& built, uint64_t& slices, uint64_t& errors, uint64_t& bytes) const {
     // Aggregate current statistics from all builder threads
     built = 0;
-    slices = 0;
     errors = 0;
     bytes = 0;
 
     for (const auto& builder : builderThreads) {
-        uint64_t threadBuilt, threadSlices, threadErrors, threadTsErrors, threadFiles, threadBytes;
-        builder->getStats(threadBuilt, threadSlices, threadErrors, threadTsErrors, threadFiles, threadBytes);
+        uint64_t threadBuilt, threadSlices, threadErrors, threadTsErrors, threadFiles, threadBytes, threadDelivered;
+        builder->getStats(threadBuilt, threadSlices, threadErrors, threadTsErrors, threadFiles, threadBytes,
+                          threadDelivered);
         built += threadBuilt;
-        slices += threadSlices;
         errors += threadErrors;
-        bytes += threadBytes;
+        bytes += threadDelivered;
     }
 
-    // Add the FrameBuilder-level slice count
-    slices += slicesAggregated.load();
+    // Every slice is counted once here and once in its builder thread; adding
+    // both (as this used to) doubled the slice count.
+    slices = slicesAggregated.load();
 }
 
 } // namespace e2sar

@@ -151,10 +151,14 @@ Shifter needs the image named on the job (`--image=...`), unlike podman-hpc.
 
 ## 4. Run interactively on Perlmutter
 
-### The URI coda-fb needs
+### The URIs coda-fb needs
 
-`coda-fb --uri` expects the **instance URI** returned when the load balancer is
-reserved, not the base control-plane URI. Reserving is a separate step that
+`coda-fb --recv-ejfat-uri` (container: `RECV_EJFAT_URI`, formerly `--uri` /
+`EJFAT_URI`, both still accepted) expects the **instance URI** returned when
+the load balancer is reserved, not the base control-plane URI. If built frames
+are forwarded, `--send-ejfat-uri` (`SEND_EJFAT_URI`) is the instance URI of a
+**second, separately reserved** load balancer; it must contain `data=` and
+`sync=` addresses. Both carry instance tokens and are handled the same way. Reserving is a separate step that
 happens wherever you manage the LB — commonly a JLab host or your own
 workstation, not a Perlmutter login node. Perlmutter only needs the resulting
 instance URI.
@@ -228,7 +232,7 @@ podman-hpc run --rm -it \
   --net host \
   --group-add keep-groups \
   -v $SCRATCH/coda-fb:/data \
-  -e EJFAT_URI='ejfat://token@cp-host:18347/lb/1?data=10.0.0.5:10000' \
+  -e RECV_EJFAT_URI='ejfats://token@cp-host:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \
   -e RECEIVER_IP=10.0.0.5 \
   -e THREADS=4 \
   -e EXPECTED_STREAMS=3 \
@@ -284,7 +288,7 @@ podman-hpc run --rm \
   --net host \
   --group-add keep-groups \
   -v "$OUTDIR":/data \
-  -e EJFAT_URI="$EJFAT_URI" \
+  -e RECV_EJFAT_URI="$EJFAT_URI" \
   -e RECEIVER_IP="$RECEIVER_IP" \
   -e RECEIVER_PORT=10000 \
   -e THREADS=4 \
@@ -328,7 +332,7 @@ committing it.
 #SBATCH --volume="/pscratch/sd/<u>/<user>/coda-fb:/data"
 
 srun shifter /usr/local/bin/entrypoint.sh \
-  --uri "$EJFAT_URI" \
+  --recv-ejfat-uri "$EJFAT_URI" \
   --ip "$(hostname -I | awk '{print $1}')" \
   --threads 4 --enable-framebuild=1 \
   --expected-streams 3 --fb-output-dir /data
@@ -376,7 +380,9 @@ entrypoint translates SIGTERM into SIGINT so the load-balancer deregistration in
 advance warning before the time limit, and give `podman-hpc stop -t 90` more time
 than `SHUTDOWN_GRACE` (default 60 s). If `coda-fb` has not exited by then the
 entrypoint escalates to SIGKILL and logs that deregistration may not have
-completed.
+completed. When forwarding, shutdown also waits up to `SEND_DRAIN_TIMEOUT`
+(default 10 s) for completed frames to be sent before the sender registration
+on the second LB is removed; keep `SHUTDOWN_GRACE` comfortably larger.
 
 ---
 
@@ -389,13 +395,13 @@ translation and the ET lifecycle:
 Variables are translated into `coda-fb` flags; anything you append after the
 image name is added to the end of the command line.
 
-**Raw flags.** If you pass `--uri` yourself, the command line is authoritative
+**Raw flags.** If you pass `--recv-ejfat-uri` (or the deprecated `--uri`) yourself, the command line is authoritative
 and the environment is not consulted at all. This is the natural style for
 Shifter and plain `srun`:
 
 ```bash
 shifter /usr/local/bin/entrypoint.sh \
-  --uri "$EJFAT_URI" --ip 10.0.0.5 --threads 4 \
+  --recv-ejfat-uri "$EJFAT_URI" --ip 10.0.0.5 --threads 4 \
   --enable-framebuild=1 --expected-streams 3 --fb-output-dir /data
 ```
 
@@ -418,7 +424,7 @@ and override the environment.
 
 | Variable | Flag | Notes |
 |---|---|---|
-| `EJFAT_URI` | `--uri` | The **instance** URI returned when the load balancer is reserved, not the base control-plane URI. Carries an instance token. |
+| `RECV_EJFAT_URI` | `--recv-ejfat-uri` | The **instance** URI returned when the load balancer to receive from is reserved, not the base control-plane URI. Carries an instance token. `EJFAT_URI` is the deprecated name for the same thing; set one, not both. |
 | `RECEIVER_IP` | `--ip` | Or `AUTO_IP=1` for `--autoip`. Exactly one of the two. |
 
 **Receiver**
@@ -432,6 +438,8 @@ and override the environment.
 | `BUFSIZE` | `--bufsize` | unset (3 MB) |
 | `RECV_TIMEOUT` | `--timeout` | unset (500 ms) |
 | `REPORT_INTERVAL` | `--report-interval` | unset (5000 ms) |
+| `METRICS_PORT` | `--metrics-port` | unset (Prometheus endpoint off) |
+| `METRICS_BIND` | `--metrics-bind` | unset (`127.0.0.1`); `0.0.0.0` to allow a remote Prometheus |
 | `PREFER_IPV6` | `--ipv6` | `0` |
 | `TLS_NOVALIDATE` | `--novalidate` | `0` |
 
@@ -458,6 +466,28 @@ and override the environment.
 | `OUTPUT_DIR` | `--output-dir` | required when `ENABLE_FRAMEBUILD=0` |
 | `FILE_PREFIX` | `--prefix` | unset (`events`) |
 | `FILE_EXTENSION` | `--extension` | unset (`.bin`) |
+
+**Forwarding built frames to a second load balancer** (needs `ENABLE_FRAMEBUILD=1`;
+see the [top-level README](../README.md#forwarding-built-frames-to-a-second-load-balancer))
+
+| Variable | Flag | Default |
+|---|---|---|
+| `SEND_EJFAT_URI` | `--send-ejfat-uri` | unset (forwarding disabled). Instance URI of the second LB. |
+| `SEND_DATA_ID` | `--send-data-id` | unset (`1`) |
+| `SEND_SRC_ID` | `--send-src-id` | unset (derived from the host name) |
+| `SEND_SENDER_IP` | `--send-sender-ip` | unset (auto-detected); space-separated list |
+| `SEND_EVENT_OFFSET` | `--send-event-offset` | unset (`1`) |
+| `SEND_PARTIAL_FRAMES` | `--send-partial-frames` | unset (`1`) |
+| `SEND_MTU` | `--send-mtu` | unset (`1500`) |
+| `SEND_SOCKETS` | `--send-sockets` | unset (`4`) |
+| `SEND_BUFSIZE` | `--send-bufsize` | unset (3 MB) |
+| `SEND_RATE` | `--send-rate` | unset (unlimited) |
+| `SEND_IPV6` | `--send-ipv6` | `0` |
+| `SEND_QUEUE_FRAMES` | `--send-queue-frames` | unset (`256`) |
+| `SEND_QUEUE_BYTES` | `--send-queue-bytes` | unset (512 MiB) |
+| `SEND_OVERFLOW` | `--send-overflow` | unset (`block`) |
+| `SEND_BLOCK_TIMEOUT` | `--send-block-timeout` | unset (1000 ms) |
+| `SEND_DRAIN_TIMEOUT` | `--send-drain-timeout` | unset (10000 ms) — keep `SHUTDOWN_GRACE` well above it |
 
 **Container-only**
 
@@ -498,7 +528,7 @@ On an ordinary Linux host with Docker:
 ```bash
 docker run -d --name coda-fb --network host \
   -v /data/frames:/data \
-  -e EJFAT_URI='ejfat://token@cp-host:18347/lb/1?data=10.0.0.5:10000' \
+  -e RECV_EJFAT_URI='ejfats://token@cp-host:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \
   -e RECEIVER_IP=10.0.0.5 -e THREADS=4 -e EXPECTED_STREAMS=3 \
   <DOCKERHUB_USER>/coda-fb:v1.0.0
 
@@ -522,13 +552,19 @@ ssh daq-host 'gunzip -c /tmp/coda-fb-v1.0.0.tar.gz | docker load'
 | Symptom | Cause |
 |---|---|
 | `ERROR: RECEIVER_IP is required` | Neither `RECEIVER_IP` nor `AUTO_IP=1` set. |
-| `ERROR: frame building needs at least one output` | `FB_OUTPUT_DIR` and `ET_FILE` both empty. |
+| `ERROR: frame building needs at least one output` | `FB_OUTPUT_DIR`, `ET_FILE` and `SEND_EJFAT_URI` all empty. |
+| `ERROR: --send-ejfat-uri: no IPv4 sync= address` | The send URI is not the full instance URI of the second LB. |
+| `ERROR: ... name the same load balancer instance` | `SEND_EJFAT_URI` points at the LB you receive from; reserve a second one. |
+| `unable to register as a sender with the send LB` | Second LB not reachable or token lacks permission; nothing else was started or registered. |
+| `Dropped: overflow N` or `Blocked: N submits` growing | The second LB path cannot keep up; see the forwarding section of the top-level README. |
 | `ERROR: FB_OUTPUT_DIR '/data' is not writable by uid N` | Output path not volume-mounted, or owned by another uid. Mount `$SCRATCH`; add `--group-add keep-groups` for CFS. |
 | Statistics stay at zero | Missing `--net host`, `RECEIVER_IP` not routable from the load balancer, or the port range is blocked. |
 | `et_start exited before creating ...` | Missing `--ipc=host`, or `ET_FILE`'s directory not writable. Under Shifter, `/tmp` is reserved. |
 | `Frame builder: NOT COMPILED` | Image built without ET. The build should fail first — rebuild with `--no-cache`. |
 | Job killed with no final statistics | Stop timeout shorter than `SHUTDOWN_GRACE`, or no `--signal=B:TERM@120`. |
 | `podman-hpc` image missing in a job | Built locally without `podman-hpc migrate`. |
+| `cannot listen for metrics on ...` | `METRICS_PORT` already used on the host (host networking: one port per instance). |
+| Prometheus target down, process fine | `METRICS_BIND` is `127.0.0.1` (default) but Prometheus scrapes from another host. |
 | `exec format error` | Image built for arm64. Rebuild with `--platform linux/amd64`. |
 
 More detail: `-e VERBOSE_FRAMES=1` (frame building) or

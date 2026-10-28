@@ -1,0 +1,17 @@
+# Prometheus configuration used by docker-compose.yml. List every coda-fb
+# instance (--metrics-port; --metrics-bind must be reachable from this host).
+# For batch jobs add the file_sd job from ../prometheus.yml.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - coda-fb-alerts.yml
+
+scrape_configs:
+  - job_name: coda-fb
+    static_configs:
+      - targets: ['localhost:9465']      # e.g. add 'daq-fb1.example.org:9465'
+        labels:
+          role: frame-builder

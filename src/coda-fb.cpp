@@ -1,10 +1,21 @@
 /**
- * Standalone E2SAR Receiver - Receives UDP packets from EJFAT load balancer,
- * reconstructs them into frames, and persists frames to a file.
+ * CODA Frame Builder - receives UDP packets from an EJFAT load balancer,
+ * reassembles them into frames and either persists the raw frames to a file
+ * (reassembly-only mode) or aggregates them into EVIO-6 time frames.
  *
- * This program registers with the EJFAT Control Plane, accepts segmented UDP
- * packets, reassembles them into complete events/frames, and appends all events
- * to a single output file. The file is properly closed when Ctrl+C is pressed.
+ * Pipeline with frame building and forwarding enabled:
+ *
+ *   EJFAT LB #1 --UDP--> E2SAR Reassembler --> reception loop --> FrameBuilder
+ *     (--recv-ejfat-uri,   (worker on LB #1)                       |  ET / files
+ *      worker)                                                     v
+ *                        EJFAT LB #2 <--UDP-- E2SAR Segmenter <-- FrameSender
+ *                        (--send-ejfat-uri,     (sender on LB #2)
+ *                         sender)
+ *
+ * The program registers with the EJFAT control plane(s), accepts segmented
+ * UDP packets, reassembles them, builds frames and forwards each built frame
+ * as one E2SAR event. Ctrl+C (SIGINT) shuts the pipeline down in data-flow
+ * order and drains forwarded frames, see shutdownPipeline().
  */
 
 #include <signal.h>
@@ -23,9 +34,20 @@
 #include <boost/filesystem.hpp>
 #include <locale>
 
+#include <algorithm>
+#include <condition_variable>
+#include <optional>
+#include <thread>
+
 #include <e2sar.hpp>
+#include "ejfat_uri_config.hpp"
+#include "metrics_endpoint.hpp"
+#include "metrics_render.hpp"
+#include "pipeline_stats.hpp"
 #ifdef ENABLE_FRAME_BUILDER
 #include "e2sar_reassembler_framebuilder.hpp"
+#include "e2sar_frame_transport.hpp"
+#include "frame_sender.hpp"
 #include <et.h>
 #else
 // Forward declaration when frame builder is not available
@@ -46,9 +68,15 @@ using namespace e2sar;
 #endif
 
 // Global state for signal handling
-bool threadsRunning = true;
+std::atomic<bool> threadsRunning{true};  // cleared by the SIGINT handler (lock-free, so signal-safe)
 Reassembler *reasPtr{nullptr};
+bool workerRegistered{false};            // registerWorker() succeeded on LB #1
 e2sar::FrameBuilder *frameBuilderPtr{nullptr};  // Global frame builder pointer (nullptr if not built with ET)
+#ifdef ENABLE_FRAME_BUILDER
+codafb::E2SARFrameTransport *sendTransportPtr{nullptr};  // forwarding to LB #2 (nullptr if disabled)
+codafb::FrameSender *frameSenderPtr{nullptr};
+bool senderSafeToDelete{true};           // false if frames or builder threads outlived shutdown
+#endif
 std::atomic<bool> handlerTriggered{false};
 int globalOutputFd{-1};  // Global file descriptor for single output file
 std::mutex fileMutex;    // Mutex to protect file writes
@@ -57,23 +85,21 @@ bool verboseReassemble = false;  // Print event numbers for all streams (reassem
 
 // Note: Frame builder is always used when ENABLE_FRAME_BUILDER is defined
 
-// Statistics
-// Data Frames stage (UDP packets reassembled into data frames by E2SAR)
-std::atomic<u_int64_t> dataFramesReceived{0};      // Data frames reassembled from UDP packets
-std::atomic<u_int64_t> dataFramesBytesTotal{0};    // Total bytes of data frames
+// Statistics: definitions and measurement boundaries are in pipeline_stats.hpp.
+// E2SAR's own receive/send statistics are polled at report time.
+codafb::PipelineStats pipelineStats;
 
-// Build Events stage (data frames aggregated into build events by frame builder)
-std::atomic<u_int64_t> buildEventsWritten{0};      // Build events written to file/ET
-std::atomic<u_int64_t> buildEventsBytesTotal{0};   // Total bytes of build events
+// Prometheus endpoint (--metrics-port). It reads the E2SAR objects only once
+// startup has published them (e2sarStatsReady), and statsSourceMutex keeps a
+// scrape from reading the segmenter while shutdown tears it down.
+codafb::MetricsEndpoint *metricsEndpointPtr{nullptr};
+std::mutex statsSourceMutex;
+std::atomic<bool> e2sarStatsReady{false};
+
+// Reassembly-only mode output (raw frames written to one file)
+std::atomic<u_int64_t> buildEventsWritten{0};      // Frames written to the output file
+std::atomic<u_int64_t> buildEventsBytesTotal{0};   // Bytes of those frames
 std::atomic<u_int64_t> writeErrors{0};
-
-// Error counters
-std::atomic<u_int64_t> receivedWithError{0};
-std::atomic<u_int64_t> payloadValidationErrors{0};
-std::atomic<u_int64_t> wrongEndiannessCount{0};
-
-// Timing for rate calculations
-auto startTime = boost::chrono::high_resolution_clock::now();
 
 u_int16_t reportThreadSleepMs{1000};
 
@@ -129,7 +155,10 @@ void ctrlCHandler(int sig)
     if (handlerTriggered.exchange(true))
         return;
 
-    std::cout << "\nCTRL-C received, initiating shutdown..." << std::endl;
+    // write(2) rather than iostreams: only async-signal-safe calls in a handler
+    static const char msg[] = "\nCTRL-C received, initiating shutdown...\n";
+    ssize_t ignored = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    (void)ignored;
     threadsRunning = false;
 
     // NOTE: We do NOT call exit() or delete objects here!
@@ -137,24 +166,460 @@ void ctrlCHandler(int sig)
     // The main thread will detect this and perform proper cleanup.
 }
 
+// ============================================================================
+// Statistics reporting
+// ============================================================================
+
+namespace {
+
+std::string fmtBytes(double b)
+{
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(2);
+    if (b >= 1024.0 * 1024 * 1024) os << b / (1024.0 * 1024 * 1024) << " GiB";
+    else if (b >= 1024.0 * 1024)   os << b / (1024.0 * 1024) << " MiB";
+    else if (b >= 1024.0)          os << b / 1024.0 << " KiB";
+    else                           os << std::setprecision(0) << b << " B";
+    return os.str();
+}
+
+std::string fmtNs(double ns)
+{
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(1);
+    if (ns < 0)             os << "n/a";
+    else if (ns < 1e3)      os << ns << " ns";
+    else if (ns < 1e6)      os << ns / 1e3 << " us";
+    else if (ns < 1e9)      os << ns / 1e6 << " ms";
+    else                    os << ns / 1e9 << " s";
+    return os.str();
+}
+
+std::string fmtAge(const codafb::EventTime &t, int64_t nowNs)
+{
+    double age = t.ageSeconds(nowNs);
+    if (age < 0) return "never";
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(3) << age << " s ago";
+    return os.str();
+}
+
+std::string fmtRate(uint64_t delta, double sec, const char *unit)
+{
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(1) << (sec > 0 ? delta / sec : 0.0) << " " << unit << "/s";
+    return os.str();
+}
+
+std::string fmtByteRate(uint64_t delta, double sec)
+{
+    return fmtBytes(sec > 0 ? delta / sec : 0.0) + "/s";
+}
+
+// "~" marks values estimated from histogram buckets
+std::string fmtQuantiles(const codafb::Histogram &h, bool bytes)
+{
+    auto snap = h.snapshot();
+    if (snap.count == 0) return "no data";
+    auto f = [bytes](double v) { return bytes ? fmtBytes(v) : fmtNs(v); };
+    return "~p50 " + f(snap.quantile(0.50)) + ", ~p99 " + f(snap.quantile(0.99));
+}
+
+const char *readiness(bool enabled, const std::atomic<bool> &ready)
+{
+    if (!enabled) return "disabled";
+    return ready.load() ? "READY" : "NOT READY";
+}
+
+} // namespace
+
 /**
- * Perform final cleanup and print statistics
- * Called from main thread when exiting normally
+ * Values the report shows as rates. Rates are deltas between consecutive
+ * reports divided by the measured time between them (not since start).
+ */
+struct ReportSample {
+    int64_t ns{0};
+    uint64_t udpPackets{0}, udpBytes{0};
+    uint64_t events{0}, eventBytes{0};
+    uint64_t frames{0}, frameBytes{0};
+    uint64_t submitted{0}, submittedBytes{0};
+    uint64_t sentPackets{0};
+    uint64_t written{0}, writtenBytes{0};
+};
+
+/**
+ * Print one statistics report and advance 'prev'. With final=true the
+ * interval is the whole run, so rates are run averages.
+ *
+ * Only the reporting thread calls this while the pipeline runs; the final
+ * report is printed by the main thread after that thread was joined.
+ */
+void printStatisticsReport(ReportSample &prev, bool final)
+{
+    const int64_t now = codafb::monotonicNowNs();
+    const auto &st = pipelineStats;
+    const double sec = static_cast<double>(now - prev.ns) / 1e9;
+    ReportSample cur;
+    cur.ns = now;
+
+    bool building = false;
+    bool forwarding = st.health.senderEnabled.load();
+#ifdef ENABLE_FRAME_BUILDER
+    building = (frameBuilderPtr != nullptr);
+#endif
+
+    std::cout << "\n=== " << (final ? "Final Statistics" : "Statistics Report") << " ===  uptime "
+              << std::fixed << std::setprecision(1) << st.health.uptimeSeconds(now) << " s, "
+              << (final ? "rates averaged over the run" : "rates over the last ")
+              << std::setprecision(1);
+    if (!final) std::cout << sec << " s";
+    std::cout << std::endl;
+
+    std::cout << "Health: receiver " << readiness(true, st.health.receiverReady)
+              << " | builder " << readiness(building, st.health.builderReady)
+              << " | sender " << readiness(forwarding, st.health.senderReady) << std::endl;
+    std::cout << "  last event " << fmtAge(st.recv.lastEvent, now);
+    if (building) std::cout << " | last frame " << fmtAge(st.build.lastFrame, now);
+    if (forwarding) std::cout << " | last submit " << fmtAge(st.send.lastSubmitted, now)
+                              << " | last release " << fmtAge(st.send.lastReleased, now);
+    std::cout << std::endl;
+
+    if (reasPtr != nullptr) {
+        auto rs = reasPtr->getStats();
+        cur.udpPackets = rs.totalPackets;
+        cur.udpBytes = rs.totalBytes;
+        std::cout << "--- Receive: E2SAR reassembler (LB #1, measured by E2SAR) ---" << std::endl;
+        std::cout << "  UDP packets: " << rs.totalPackets << " (" << fmtRate(cur.udpPackets - prev.udpPackets, sec, "pkt")
+                  << ")   UDP payload: " << fmtBytes(rs.totalBytes) << " ("
+                  << fmtByteRate(cur.udpBytes - prev.udpBytes, sec) << ")" << std::endl;
+        std::cout << "  Events reassembled: " << rs.eventSuccess
+                  << "   Lost in reassembly (segments missing at timeout): " << rs.reassemblyLoss
+                  << "   Lost on enqueue (queue full): " << rs.enqueueLoss << std::endl;
+        std::cout << "  Bad headers: " << rs.badHeaderDiscards << "   Data socket errors: " << rs.dataErrCnt
+                  << "   gRPC errors: " << rs.grpcErrCnt << std::endl;
+    }
+
+    cur.events = st.recv.eventsReceived.value();
+    cur.eventBytes = st.recv.bytesReceived.value();
+    std::cout << "--- Receive: coda-fb reception loop ---" << std::endl;
+    std::cout << "  Events: " << cur.events << " (" << fmtRate(cur.events - prev.events, sec, "evt")
+              << ")   Bytes: " << fmtBytes(cur.eventBytes) << " ("
+              << fmtByteRate(cur.eventBytes - prev.eventBytes, sec) << ")" << std::endl;
+    std::cout << "  recvEvent errors: " << st.recv.recvErrors.value()
+              << "   Payload validation errors: " << st.recv.payloadValidationErrors.value()
+              << "   Wrong endianness: " << st.recv.wrongEndianness.value() << std::endl;
+
+    if (building) {
+        const auto &b = st.build;
+        cur.frames = b.framesComplete.value() + b.framesPartial.value();
+        cur.frameBytes = b.bytesSerialized.value();
+        std::cout << "--- Frame building ---" << std::endl;
+        std::cout << "  Slices in: " << b.slicesIn.value()
+                  << "   Frames: complete " << b.framesComplete.value()
+                  << ", partial " << b.framesPartial.value()
+                  << ", build failed " << b.framesBuildFailed.value()
+                  << ", discarded at shutdown " << b.framesDiscardedShutdown.value()
+                  << " (" << b.slicesDiscardedShutdown.value() << " slices)" << std::endl;
+        std::cout << "  Built: " << fmtRate(cur.frames - prev.frames, sec, "frames") << ", "
+                  << fmtByteRate(cur.frameBytes - prev.frameBytes, sec)
+                  << "   Pending now: " << b.slicesPending.value() << " slices, "
+                  << b.framesInProgress.value() << " frames in progress" << std::endl;
+        std::cout << "  Frame size " << fmtQuantiles(b.frameBytes, true)
+                  << "   Serialize " << fmtQuantiles(b.serializeNs, false)
+                  << "   Assembly " << fmtQuantiles(b.assemblyNs, false) << std::endl;
+#ifdef ENABLE_FRAME_BUILDER
+        uint64_t delivered, slices, errors, bytes;
+        frameBuilderPtr->getStatistics(delivered, slices, errors, bytes);
+        std::cout << "  Delivered to every enabled output: " << delivered << " frames, " << fmtBytes(bytes)
+                  << "   Output errors: ET " << b.etOutputErrors.value()
+                  << ", file " << b.fileOutputErrors.value() << std::endl;
+#endif
+    } else {
+        cur.written = buildEventsWritten.load();
+        cur.writtenBytes = buildEventsBytesTotal.load();
+        std::cout << "--- Output frames (written to file) ---" << std::endl;
+        std::cout << "  Frames written: " << cur.written << " (" << fmtRate(cur.written - prev.written, sec, "frames")
+                  << ")   Bytes: " << fmtBytes(cur.writtenBytes) << " ("
+                  << fmtByteRate(cur.writtenBytes - prev.writtenBytes, sec) << ")   Write errors: "
+                  << writeErrors.load() << std::endl;
+    }
+
+#ifdef ENABLE_FRAME_BUILDER
+    if (forwarding) {
+        const auto &f = st.send;
+        cur.submitted = f.framesSubmitted.value();
+        cur.submittedBytes = f.bytesSubmitted.value();
+        std::cout << "--- Forwarding to LB #2 (local submission only; downstream delivery is NOT measured) ---" << std::endl;
+        std::cout << "  Offered: " << f.framesOffered.value()
+                  << "   Submitted: " << cur.submitted << " (" << fmtRate(cur.submitted - prev.submitted, sec, "frames")
+                  << ", " << fmtByteRate(cur.submittedBytes - prev.submittedBytes, sec) << ")"
+                  << "   Released by E2SAR: " << f.framesReleased.value() << std::endl;
+        std::cout << "  Dropped: overflow " << f.framesDroppedOverflow.value()
+                  << ", shutdown " << f.framesDroppedShutdown.value()
+                  << "   Rejected: " << f.framesRejected.value()
+                  << "   Partial not forwarded: " << f.framesNotForwardedPartial.value()
+                  << "   Queue-full retries: " << f.submitRetries.value();
+        if (final) std::cout << "   Abandoned at shutdown: " << f.framesAbandonedShutdown.value();
+        std::cout << std::endl;
+        std::cout << "  In flight: " << f.inFlightFrames.value() << "/" << f.capacityFrames.value() << " frames, "
+                  << fmtBytes(f.inFlightBytes.value()) << "/" << fmtBytes(f.capacityBytes.value())
+                  << "   Blocked: " << f.blockedSubmits.value() << " submits, "
+                  << fmtNs(static_cast<double>(f.blockedNs.value())) << " total" << std::endl;
+        std::cout << "  Queue wait " << fmtQuantiles(f.queueWaitNs, false)
+                  << "   E2SAR release latency " << fmtQuantiles(f.releaseLatencyNs, false) << std::endl;
+        if (sendTransportPtr != nullptr) {
+            auto ss = sendTransportPtr->sendStats();
+            auto sy = sendTransportPtr->syncStats();
+            cur.sentPackets = ss.msgCnt;
+            std::cout << "--- Forwarding: E2SAR segmenter (measured by E2SAR) ---" << std::endl;
+            std::cout << "  Packets: " << ss.msgCnt << " (" << fmtRate(cur.sentPackets - prev.sentPackets, sec, "pkt")
+                      << "; coda-fb estimate " << f.packetsEstimated.value() << ")"
+                      << "   Packet send errors: " << ss.errCnt;
+            if (ss.errCnt > 0) std::cout << " (last: " << strerror(ss.lastErrno) << ")";
+            std::cout << "   Sync messages: " << sy.msgCnt << ", sync errors: " << sy.errCnt << std::endl;
+        }
+    }
+#endif
+    std::cout << "=========================" << std::endl;
+    prev = cur;
+}
+
+std::mutex statsMutex;
+std::condition_variable statsCV;
+bool statsStop{false};
+
+/** Prints a report every --report-interval ms until stopStatsReporting(). */
+void statsReportingThread()
+{
+    ReportSample prev;
+    prev.ns = pipelineStats.health.startNs;
+    std::unique_lock<std::mutex> lock(statsMutex);
+    while (!statsCV.wait_for(lock, std::chrono::milliseconds(reportThreadSleepMs), [] { return statsStop; }))
+    {
+        lock.unlock();
+        printStatisticsReport(prev, false);
+        lock.lock();
+    }
+}
+
+void stopStatsReporting(std::thread &t)
+{
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        statsStop = true;
+    }
+    statsCV.notify_all();
+    if (t.joinable())
+        t.join();
+}
+
+/**
+ * Render /metrics. Runs on the endpoint thread. Before startup completes only
+ * coda-fb's own (atomic) statistics are rendered; E2SAR families appear once
+ * the reassembler and segmenter exist.
+ */
+std::string renderMetrics(bool building, bool forwarding)
+{
+    codafb::MetricsSources src;
+    src.stats = &pipelineStats;
+    src.building = building;
+    src.forwarding = forwarding;
+    src.version = CODA_FB_VERSION;
+    src.e2sarVersion = get_Version();
+    if (e2sarStatsReady.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(statsSourceMutex);
+        if (reasPtr != nullptr) {
+            auto r = reasPtr->getStats();
+            codafb::E2SARReceiveSnapshot rs;
+            rs.packets = r.totalPackets;
+            rs.bytes = r.totalBytes;
+            rs.reassembled = r.eventSuccess;
+            rs.lostReassembly = r.reassemblyLoss;
+            rs.lostEnqueue = r.enqueueLoss;
+            rs.badHeaders = r.badHeaderDiscards;
+            rs.socketErrors = static_cast<uint64_t>(r.dataErrCnt);
+            rs.grpcErrors = static_cast<uint64_t>(r.grpcErrCnt);
+            src.recv = rs;
+        }
+#ifdef ENABLE_FRAME_BUILDER
+        if (sendTransportPtr != nullptr) {
+            auto ss = sendTransportPtr->sendStats();
+            auto sy = sendTransportPtr->syncStats();
+            codafb::E2SARSendSnapshot snap;
+            snap.packets = ss.msgCnt;
+            snap.packetErrors = ss.errCnt;
+            snap.syncMessages = sy.msgCnt;
+            snap.syncErrors = sy.errCnt;
+            src.send = snap;
+        }
+#endif
+    }
+    codafb::stampNow(src);
+    return codafb::renderPrometheus(src);
+}
+
+/** Stop serving /metrics; must happen before the E2SAR objects are deleted. */
+void stopMetricsEndpoint()
+{
+    e2sarStatsReady = false;
+    if (metricsEndpointPtr != nullptr) {
+        metricsEndpointPtr->stop();
+        std::cout << "Metrics endpoint stopped after " << metricsEndpointPtr->scrapes() << " scrapes" << std::endl;
+        delete metricsEndpointPtr;
+        metricsEndpointPtr = nullptr;
+    }
+}
+
+// ============================================================================
+// Startup and shutdown
+// ============================================================================
+
+/**
+ * Release everything that startup created, in reverse order, after a startup
+ * failure or an exception. Safe to call with any subset initialized.
+ */
+void cleanupAfterFailure()
+{
+    stopMetricsEndpoint();
+
+    if (reasPtr != nullptr)
+    {
+        if (workerRegistered)
+        {
+            auto deregres = reasPtr->deregisterWorker();
+            if (deregres.has_error())
+                std::cerr << "Unable to deregister worker: "
+                          << codafb::redactCredentials(deregres.error().message()) << std::endl;
+            workerRegistered = false;
+        }
+        reasPtr->stopThreads();
+        delete reasPtr;
+        reasPtr = nullptr;
+    }
+    pipelineStats.health.receiverReady = false;
+
+#ifdef ENABLE_FRAME_BUILDER
+    bool buildersJoined = true;
+    if (frameBuilderPtr != nullptr)
+    {
+        if (pipelineStats.health.builderReady.exchange(false))
+        {
+            frameBuilderPtr->stop(3000);
+            buildersJoined = frameBuilderPtr->allThreadsJoined();
+        }
+        // leaked if a builder thread is still running, as on normal exit
+        if (buildersJoined)
+            delete frameBuilderPtr;
+        frameBuilderPtr = nullptr;
+    }
+    if (frameSenderPtr != nullptr)
+    {
+        frameSenderPtr->beginShutdown(std::chrono::steady_clock::now());
+        size_t abandoned = frameSenderPtr->finishShutdown();
+        senderSafeToDelete = (abandoned == 0) && buildersJoined;
+    }
+    if (sendTransportPtr != nullptr)
+    {
+        if (senderSafeToDelete)
+        {
+            sendTransportPtr->shutdown();
+            delete frameSenderPtr;
+            delete sendTransportPtr;
+        }
+        else
+        {
+            sendTransportPtr->abandon();
+        }
+        frameSenderPtr = nullptr;
+        sendTransportPtr = nullptr;
+    }
+    pipelineStats.health.senderReady = false;
+#endif
+
+    if (globalOutputFd >= 0)
+    {
+        close(globalOutputFd);
+        globalOutputFd = -1;
+    }
+}
+
+/**
+ * Orderly shutdown in data-flow order, after the reception loop has exited:
+ * 1. Deregister from LB #1 first, before any call that can block, so the LB
+ *    stops sending even if a later step hangs; then stop the receive threads.
+ * 2. Bound every wait in the frame sender by the drain deadline.
+ * 3. Stop the builder threads; each finishes and forwards its current frame.
+ *    Slices still waiting in builder FIFOs are counted as discarded.
+ * 4. Wait, up to the deadline, until E2SAR has released every forwarded frame.
+ * 5. Stop the E2SAR segmenter and remove the sender registration from LB #2.
+ *    If frames are still in flight, the segmenter is left running instead
+ *    (it still uses the buffers) and only the registration is removed.
+ */
+void shutdownPipeline(Reassembler *r, e2sar::FrameBuilder *frameBuilder, int drainTimeoutMs)
+{
+    if (r != nullptr) {
+        std::cout << "Deregistering worker from control plane..." << std::endl;
+        auto deregres = r->deregisterWorker();
+        if (deregres.has_error())
+            std::cerr << "Unable to deregister worker: "
+                      << codafb::redactCredentials(deregres.error().message()) << std::endl;
+        else
+            std::cout << "Worker deregistered successfully" << std::endl;
+        workerRegistered = false;
+
+        std::cout << "Stopping reassembler threads..." << std::endl;
+        r->stopThreads();
+        std::cout << "Reassembler threads stopped" << std::endl;
+    }
+    pipelineStats.health.receiverReady = false;
+
+#ifdef ENABLE_FRAME_BUILDER
+    if (frameSenderPtr != nullptr) {
+        std::cout << "Draining forwarded frames (deadline " << drainTimeoutMs << " ms)..." << std::endl;
+        frameSenderPtr->beginShutdown(std::chrono::steady_clock::now() + std::chrono::milliseconds(drainTimeoutMs));
+    }
+
+    // Builders may wait for the sender up to the drain deadline, and ET calls
+    // time out after 2 s, so allow for both before detaching a thread.
+    if (frameBuilder != nullptr) {
+        frameBuilder->stop(drainTimeoutMs + 3000);
+        pipelineStats.health.builderReady = false;
+    }
+
+    if (frameSenderPtr != nullptr) {
+        size_t abandoned = frameSenderPtr->finishShutdown();
+        pipelineStats.health.senderReady = false;
+        bool buildersJoined = (frameBuilder == nullptr) || frameBuilder->allThreadsJoined();
+        senderSafeToDelete = (abandoned == 0) && buildersJoined;
+        if (abandoned == 0) {
+            std::cout << "All forwarded frames were released by E2SAR" << std::endl;
+        } else {
+            std::cerr << "WARNING: " << abandoned << " forwarded frame(s) were still in flight at the drain "
+                      << "deadline; they are counted as abandoned and may or may not have been sent" << std::endl;
+        }
+        // a concurrent scrape may be reading the segmenter's statistics
+        std::lock_guard<std::mutex> lock(statsSourceMutex);
+        if (senderSafeToDelete) {
+            sendTransportPtr->shutdown();
+        } else {
+            sendTransportPtr->abandon();
+        }
+    }
+#else
+    (void)drainTimeoutMs;
+#endif
+}
+
+/**
+ * Print final statistics and release what shutdownPipeline() left behind.
+ * Called from the main thread after the statistics thread was joined.
  */
 void performFinalCleanup()
 {
     std::cout << "\nPerforming final cleanup..." << std::endl;
 
-    // Clean up frame builder (already stopped in receiveAndWriteFrames)
-    // NOTE: We intentionally leak the frameBuilderPtr to avoid hanging
-    // in the destructor if Builder-0 thread is still running. The OS
-    // will clean up all resources when the process exits.
-    if (frameBuilderPtr != nullptr) {
-        frameBuilderPtr->printStatistics();
-        // DO NOT DELETE: Causes hang if thread was detached
-        // delete frameBuilderPtr;
-        frameBuilderPtr = nullptr;
-    }
+    // Prometheus keeps the last scraped values; stop before deleting E2SAR objects.
+    stopMetricsEndpoint();
 
     // Close output file if open
     if (globalOutputFd >= 0)
@@ -165,63 +630,28 @@ void performFinalCleanup()
         globalOutputFd = -1;
     }
 
+    ReportSample whole;
+    whole.ns = pipelineStats.health.startNs;
+    printStatisticsReport(whole, true);
+
+    // NOTE: We intentionally leak the frameBuilderPtr to avoid hanging
+    // in the destructor if a builder thread was detached. The OS
+    // will clean up all resources when the process exits.
+    frameBuilderPtr = nullptr;
+
+#ifdef ENABLE_FRAME_BUILDER
+    // Leaked for the same reason when frames or threads outlived shutdown.
+    if (senderSafeToDelete) {
+        delete frameSenderPtr;
+        delete sendTransportPtr;
+    }
+    frameSenderPtr = nullptr;
+    sendTransportPtr = nullptr;
+#endif
+
     if (reasPtr != nullptr)
     {
-        // NOTE: deregisterWorker() and stopThreads() were already called in
-        // receiveAndWriteFrames() before any blocking stop calls. Don't repeat them here.
-
-        // Print final statistics
-        // getStats() returns a tuple: <eventsRecvd, eventsReassembled, dataErrCnt, reassemblyLoss, enqueueLoss, lastE2SARError>
-        auto stats = reasPtr->getStats();
-
-        // Calculate final elapsed time and rates
-        auto endTime = boost::chrono::high_resolution_clock::now();
-        auto totalElapsedMs = boost::chrono::duration_cast<boost::chrono::milliseconds>(endTime - startTime).count();
-        double totalElapsedSec = totalElapsedMs / 1000.0;
-
-        // Calculate average data frame rates (UDP packets reassembled into data frames)
-        double avgDataFrameRate = (totalElapsedSec > 0) ? (dataFramesReceived.load() / totalElapsedSec) : 0.0;
-        double avgDataFrameDataRateMBps = (totalElapsedSec > 0) ? (dataFramesBytesTotal.load() / totalElapsedSec / (1024.0 * 1024.0)) : 0.0;
-
-        // Calculate average build event rates (data frames aggregated into build events)
-        double avgBuildEventRate = (totalElapsedSec > 0) ? (buildEventsWritten.load() / totalElapsedSec) : 0.0;
-        double avgBuildEventDataRateMBps = (totalElapsedSec > 0) ? (buildEventsBytesTotal.load() / totalElapsedSec / (1024.0 * 1024.0)) : 0.0;
-
-        std::cout << "\n======= Final Statistics =======" << std::endl;
-        std::cout << "Mode: " << (frameBuilderPtr != nullptr ? "Frame Building" : "Reassembly-Only") << std::endl;
-        std::cout << "--- Data Frames (Reassembled from UDP) ---" << std::endl;
-        std::cout << "\tData Frames: " << dataFramesReceived << std::endl;
-        std::cout << "\tData Volume: " << std::fixed << std::setprecision(2)
-                  << (dataFramesBytesTotal.load() / (1024.0 * 1024.0)) << " MB" << std::endl;
-        std::cout << "\tAvg Frame Rate: " << std::fixed << std::setprecision(2)
-                  << avgDataFrameRate << " frames/sec" << std::endl;
-        std::cout << "\tAvg Data Rate: " << std::fixed << std::setprecision(2)
-                  << avgDataFrameDataRateMBps << " MB/sec" << std::endl;
-
-        if (frameBuilderPtr != nullptr) {
-            std::cout << "--- Build Events (Aggregated/Written) ---" << std::endl;
-        } else {
-            std::cout << "--- Output Frames (Written to File) ---" << std::endl;
-        }
-        std::cout << "\t" << (frameBuilderPtr != nullptr ? "Build Events" : "Frames Written")
-                  << ": " << buildEventsWritten << std::endl;
-        std::cout << "\tData Volume: " << std::fixed << std::setprecision(2)
-                  << (buildEventsBytesTotal.load() / (1024.0 * 1024.0)) << " MB" << std::endl;
-        std::cout << "\tAvg Rate: " << std::fixed << std::setprecision(2)
-                  << avgBuildEventRate << " "
-                  << (frameBuilderPtr != nullptr ? "events" : "frames") << "/sec" << std::endl;
-        std::cout << "\tAvg Data Rate: " << std::fixed << std::setprecision(2)
-                  << avgBuildEventDataRateMBps << " MB/sec" << std::endl;
-        std::cout << "--- Errors ---" << std::endl;
-        std::cout << "\tWrite Errors: " << writeErrors << std::endl;
-        std::cout << "\tReceive Errors: " << receivedWithError << std::endl;
-        std::cout << "\tPayload Validation Errors: " << payloadValidationErrors << std::endl;
-        std::cout << "\tWrong Endianness Count: " << wrongEndiannessCount << std::endl;
-        std::cout << "--- Runtime ---" << std::endl;
-        std::cout << "\tTotal Elapsed Time: " << std::fixed << std::setprecision(1)
-                  << totalElapsedSec << " sec" << std::endl;
-        std::cout << "================================" << std::endl;
-
+        // deregisterWorker() and stopThreads() were already called in shutdownPipeline()
         delete reasPtr;
         reasPtr = nullptr;
     }
@@ -513,8 +943,10 @@ result<int> prepareToReceive(Reassembler &r)
     if (regres.has_error())
     {
         return E2SARErrorInfo{E2SARErrorc::RPCError,
-            "Unable to register worker node: " + regres.error().message()};
+            "Unable to register worker node: " + codafb::redactCredentials(regres.error().message())};
     }
+    // From here on a failure must deregister, see cleanupAfterFailure()
+    workerRegistered = true;
     std::cout << "done" << std::endl;
 
     // Open sockets and start receiver threads
@@ -531,8 +963,11 @@ result<int> prepareToReceive(Reassembler &r)
  * ============================================================================
  *
  * Receives reassembled frames from the E2SAR reassembler and either:
- * - Sends them to the frame builder for aggregation (if enabled)
+ * - Sends them to the frame builder for aggregation (if enabled), which also
+ *   forwards built frames to the second load balancer (if enabled)
  * - Writes them directly to an output file (original mode)
+ *
+ * Returns when Ctrl+C is pressed; the caller then runs shutdownPipeline().
  *
  * Each frame is validated by parsing its EVIO payload structure to ensure
  * data integrity and extract accurate metadata.
@@ -573,7 +1008,7 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
         if (getEvtRes.has_error())
         {
             // Error occurred during reception - log and continue
-            receivedWithError++;
+            pipelineStats.recv.recvErrors.add();
             continue;
         }
 
@@ -582,8 +1017,9 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
             continue;
 
         // Successfully received a frame
-        dataFramesReceived++;
-        dataFramesBytesTotal += eventSize;  // Track total data volume
+        pipelineStats.recv.eventsReceived.add();
+        pipelineStats.recv.bytesReceived.add(eventSize);  // Track total data volume
+        pipelineStats.recv.lastEvent.mark();
 
         // ====================================================================
         // STEP 2: Parse and Validate EVIO Payload
@@ -595,7 +1031,7 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
         if (!meta.valid) {
             // VALIDATION FAILED: Payload is corrupt or incorrectly assembled
             // This frame cannot be used - skip it and continue to next frame
-            payloadValidationErrors++;
+            pipelineStats.recv.payloadValidationErrors.add();
             std::cerr << "Skipping frame " << eventNum << " due to invalid payload" << std::endl;
 
             // Clean up the unusable frame buffer
@@ -610,7 +1046,7 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
         if (meta.wrongEndian) {
             // WARNING: Frame had wrong byte ordering but was corrected
             // This indicates potential issue with data source but data is usable
-            wrongEndiannessCount++;
+            pipelineStats.recv.wrongEndianness.add();
             // Note: The parseEVIOPayload function has already byte-swapped
             // the data, so we can proceed normally
         }
@@ -660,7 +1096,6 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
                 eventBuf,        // Pointer to payload data (ownership transferred!)
                 eventSize        // Size of payload
             );
-            // Note: buildEventsWritten is updated from frame builder statistics in statsReportingThread
             // Note: eventBuf is NOT deleted here - frame builder now owns it
             eventBuf = nullptr;  // Clear pointer to prevent accidental double-delete
         } else {
@@ -712,121 +1147,29 @@ result<int> receiveAndWriteFrames(Reassembler *r, int outputFd, e2sar::FrameBuil
 
     }  // End of main reception loop
 
-    // ========================================================================
-    // CLEANUP AFTER LOOP EXIT (Ctrl+C pressed or error occurred)
-    // ========================================================================
+    // Shutdown (deregistration, draining) happens in shutdownPipeline()
     std::cout << "\nFrame reception loop completed" << std::endl;
-
-    // Deregister from the LB FIRST, before any blocking stop calls.
-    // This ensures the LB stops sending data even if thread shutdown hangs.
-    if (r != nullptr) {
-        std::cout << "Deregistering worker from control plane..." << std::endl;
-        auto deregres = r->deregisterWorker();
-        if (deregres.has_error())
-            std::cerr << "Unable to deregister worker: " << deregres.error().message() << std::endl;
-        else
-            std::cout << "Worker deregistered successfully" << std::endl;
-    }
-
-    // Stop reassembler threads after deregistering so no new frames arrive.
-    if (r != nullptr) {
-        std::cout << "Stopping reassembler threads..." << std::endl;
-        r->stopThreads();
-        std::cout << "Reassembler threads stopped" << std::endl;
-    }
-
-    // Stop frame builder if it was used (no more data will arrive after stopThreads).
-    if (frameBuilder != nullptr) {
-        frameBuilder->stop();
-    }
-
-    // Close output file if open.
-    if (outputFd >= 0) {
-        std::cout << "Closing output file..." << std::endl;
-        fsync(outputFd);
-        close(outputFd);
-        globalOutputFd = -1;  // Prevent double-close in performFinalCleanup()
-        std::cout << "Output file closed" << std::endl;
-    }
-
-    std::cout << "receiveAndWriteFrames() returning" << std::endl;
     return 0;
 }
 
-void statsReportingThread(Reassembler *r)
+/** 32-bit FNV-1a, used to derive a default E2SAR source id from the host name. */
+uint32_t fnv1a32(const std::string &s)
 {
-    while(threadsRunning)
-    {
-        // getStats() returns a tuple: <eventsRecvd, eventsReassembled, dataErrCnt, reassemblyLoss, enqueueLoss, lastE2SARError>
-        auto stats = r->getStats();
-
-        // Get frame builder statistics if available
-        if (frameBuilderPtr != nullptr) {
-            uint64_t fbBuilt, fbSlices, fbErrors, fbBytes;
-            frameBuilderPtr->getStatistics(fbBuilt, fbSlices, fbErrors, fbBytes);
-
-            // Update counters with frame builder statistics
-            buildEventsWritten = fbBuilt;
-            buildEventsBytesTotal = fbBytes;
-        }
-
-        // Calculate elapsed time and rates
-        auto currentTime = boost::chrono::high_resolution_clock::now();
-        auto elapsedMs = boost::chrono::duration_cast<boost::chrono::milliseconds>(currentTime - startTime).count();
-        double elapsedSec = elapsedMs / 1000.0;
-
-        // Calculate data frame rates (UDP packets reassembled into data frames)
-        double dataFrameRate = (elapsedSec > 0) ? (dataFramesReceived.load() / elapsedSec) : 0.0;
-        double dataFrameDataRateMBps = (elapsedSec > 0) ? (dataFramesBytesTotal.load() / elapsedSec / (1024.0 * 1024.0)) : 0.0;
-
-        // Calculate build event rates (data frames aggregated into build events)
-        double buildEventRate = (elapsedSec > 0) ? (buildEventsWritten.load() / elapsedSec) : 0.0;
-        double buildEventDataRateMBps = (elapsedSec > 0) ? (buildEventsBytesTotal.load() / elapsedSec / (1024.0 * 1024.0)) : 0.0;
-
-        std::cout << "\n=== Statistics Report ===" << std::endl;
-        std::cout << "Mode: " << (frameBuilderPtr != nullptr ? "Frame Building" : "Reassembly-Only") << std::endl;
-        std::cout << "--- Data Frames (Reassembled from UDP) ---" << std::endl;
-        std::cout << "  Data Frames: " << dataFramesReceived << std::endl;
-        std::cout << "  Data Volume: " << std::fixed << std::setprecision(2)
-                  << (dataFramesBytesTotal.load() / (1024.0 * 1024.0)) << " MB" << std::endl;
-        std::cout << "  Frame Rate: " << std::fixed << std::setprecision(2)
-                  << dataFrameRate << " frames/sec" << std::endl;
-        std::cout << "  Data Rate: " << std::fixed << std::setprecision(2)
-                  << dataFrameDataRateMBps << " MB/sec" << std::endl;
-
-        if (frameBuilderPtr != nullptr) {
-            std::cout << "--- Build Events (Aggregated/Written) ---" << std::endl;
-        } else {
-            std::cout << "--- Output Frames (Written to File) ---" << std::endl;
-        }
-        std::cout << "  " << (frameBuilderPtr != nullptr ? "Build Events" : "Frames Written")
-                  << ": " << buildEventsWritten << std::endl;
-        std::cout << "  Data Volume: " << std::fixed << std::setprecision(2)
-                  << (buildEventsBytesTotal.load() / (1024.0 * 1024.0)) << " MB" << std::endl;
-        std::cout << "  Rate: " << std::fixed << std::setprecision(2)
-                  << buildEventRate << " "
-                  << (frameBuilderPtr != nullptr ? "events" : "frames") << "/sec" << std::endl;
-        std::cout << "  Data Rate: " << std::fixed << std::setprecision(2)
-                  << buildEventDataRateMBps << " MB/sec" << std::endl;
-        std::cout << "--- Errors ---" << std::endl;
-        std::cout << "  Write Errors: " << writeErrors << std::endl;
-        std::cout << "  Receive Errors: " << receivedWithError << std::endl;
-        std::cout << "--- Runtime ---" << std::endl;
-        std::cout << "  Elapsed Time: " << std::fixed << std::setprecision(1)
-                  << elapsedSec << " sec" << std::endl;
-        std::cout << "=========================" << std::endl;
-
-        auto until = boost::chrono::high_resolution_clock::now() + boost::chrono::milliseconds(reportThreadSleepMs);
-        boost::this_thread::sleep_until(until);
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 16777619u;
     }
+    return h;
 }
 
 int main(int argc, char **argv)
 {
-    po::options_description od("E2SAR Standalone Receiver Options");
+    po::options_description od("CODA Frame Builder Options");
 
     // Command line variables
-    std::string ejfat_uri;
+    std::string recvUriStr;
+    std::string legacyUriStr;
     std::string recvIP;
     std::string outputDir;
     std::string filePrefix;
@@ -841,9 +1184,12 @@ int main(int argc, char **argv)
 
     auto opts = od.add_options()("help,h", "show this help message");
 
-    // Required parameters
-    opts("uri,u", po::value<std::string>(&ejfat_uri)->required(),
-         "EJFAT URI for control plane connection (required)");
+    // EJFAT load balancer to receive from
+    opts("recv-ejfat-uri", po::value<std::string>(&recvUriStr),
+         "EJFAT instance URI of the load balancer to RECEIVE from (LB #1); coda-fb registers "
+         "there as a worker (required)");
+    opts("uri,u", po::value<std::string>(&legacyUriStr),
+         "DEPRECATED alias for --recv-ejfat-uri, kept for existing scripts; cannot be combined with it");
     opts("output-dir,o", po::value<std::string>(&outputDir)->default_value(""),
          "directory to save received frames (required unless using frame builder)");
 
@@ -923,8 +1269,11 @@ int main(int argc, char **argv)
          "event reassembly timeout in milliseconds (default: 500)");
 
     // Control plane parameters
-    opts("withcp,c", po::bool_switch(&withCP)->default_value(true), 
-         "enable control plane interactions (default: true)");
+    // implicit_value keeps a bare --withcp/-c working; it used to be a
+    // bool_switch defaulting to true, which made it impossible to turn off.
+    opts("withcp,c", po::value<bool>(&withCP)->default_value(true)->implicit_value(true),
+         "control plane interactions on the receive LB; --withcp=0 is for debugging only: no "
+         "worker registration, and packets must arrive with LB headers (default: true)");
     opts("ipv6,6", po::bool_switch(&preferV6)->default_value(false), 
          "prefer IPv6 for control plane connections");
     opts("novalidate,v", po::bool_switch()->default_value(false), 
@@ -938,6 +1287,89 @@ int main(int argc, char **argv)
     opts("report-interval", po::value<u_int16_t>(&reportThreadSleepMs)->default_value(5000), 
          "statistics reporting interval in milliseconds (default: 5000)");
 
+    // Prometheus metrics endpoint
+    u_int16_t metricsPort;
+    std::string metricsBind;
+    opts("metrics-port", po::value<u_int16_t>(&metricsPort)->default_value(0),
+         "serve Prometheus metrics at http://<metrics-bind>:<port>/metrics; 0 disables (default: 0)");
+    opts("metrics-bind", po::value<std::string>(&metricsBind)->default_value("127.0.0.1"),
+         "address the metrics endpoint listens on; 0.0.0.0 for all interfaces (default: 127.0.0.1, "
+         "this host only)");
+
+    // Forwarding of built frames to a second EJFAT load balancer
+    std::string sendUriStr;
+    u_int16_t sendDataId;
+    u_int32_t sendSrcId;
+    std::vector<std::string> sendSenderIPs;
+    u_int64_t sendEventOffset;
+    bool sendPartial;
+    u_int16_t sendMtu;
+    size_t sendSockets;
+    int sendBufSize;
+    float sendRateGbps;
+    bool sendIPv6;
+    int sendLbHdrVersion;
+    u_int16_t sendWarmUpMs;
+    bool sendNoCP;
+    size_t sendQueueFrames;
+    size_t sendQueueBytes;
+    std::string sendOverflowStr;
+    int sendBlockTimeoutMs;
+    int sendDrainTimeoutMs;
+
+    po::options_description sendOd("Forwarding built frames to a second EJFAT load balancer "
+                                   "(requires --enable-framebuild=1)");
+    auto sopts = sendOd.add_options();
+    sopts("send-ejfat-uri", po::value<std::string>(&sendUriStr)->default_value(""),
+          "EJFAT instance URI of the load balancer to SEND built frames to (LB #2); coda-fb "
+          "registers there as a sender. Empty disables forwarding");
+    sopts("send-data-id", po::value<u_int16_t>(&sendDataId)->default_value(1),
+          "E2SAR data id carried by every forwarded frame; must differ between senders whose "
+          "frames meet in one downstream reassembler (default: 1)");
+    sopts("send-src-id", po::value<u_int32_t>(&sendSrcId)->default_value(0),
+          "E2SAR event source id in sync packets, unique per sender on LB #2; 0 derives it "
+          "from the host name (default: 0)");
+    sopts("send-sender-ip", po::value<std::vector<std::string>>(&sendSenderIPs)->multitoken(),
+          "address(es) to register as sender with LB #2 (default: the local address that routes "
+          "to its data address)");
+    sopts("send-event-offset", po::value<u_int64_t>(&sendEventOffset)->default_value(1),
+          "outbound E2SAR event number = offset + built frame number; must be >= 1 because "
+          "E2SAR reserves event number 0 (default: 1)");
+    sopts("send-partial-frames", po::value<bool>(&sendPartial)->default_value(true),
+          "also forward partial frames (fewer streams than --expected-streams); ET and file "
+          "output always receive them (default: 1)");
+    sopts("send-mtu", po::value<u_int16_t>(&sendMtu)->default_value(1500),
+          "MTU for forwarded packets including IP/UDP/LB/RE headers; 0 uses the outgoing "
+          "interface MTU (default: 1500)");
+    sopts("send-sockets", po::value<size_t>(&sendSockets)->default_value(4),
+          "number of send sockets/threads, spreads packets over LB ports (default: 4)");
+    sopts("send-bufsize", po::value<int>(&sendBufSize)->default_value(3*1024*1024),
+          "send socket buffer size in bytes, limited by net.core.wmem_max (default: 3MB)");
+    sopts("send-rate", po::value<float>(&sendRateGbps)->default_value(-1.0f),
+          "send rate limit in Gbps; negative means unlimited (default: -1)");
+    sopts("send-ipv6", po::bool_switch(&sendIPv6)->default_value(false),
+          "send to the IPv6 data address of LB #2");
+    sopts("send-lbhdr-version", po::value<int>(&sendLbHdrVersion)->default_value(2),
+          "LB header version, 2 or 3 (default: 2)");
+    sopts("send-warmup", po::value<u_int16_t>(&sendWarmUpMs)->default_value(1000),
+          "milliseconds of sync packets before the first frame is sent (default: 1000)");
+    sopts("send-nocp", po::bool_switch(&sendNoCP)->default_value(false),
+          "debugging only: no sender registration and no sync packets on LB #2; packets go "
+          "straight to the URI data address");
+    sopts("send-queue-frames", po::value<size_t>(&sendQueueFrames)->default_value(256),
+          "maximum frames in flight (handed to E2SAR, not yet sent), 1-65534 (default: 256)");
+    sopts("send-queue-bytes", po::value<size_t>(&sendQueueBytes)->default_value(512ULL*1024*1024),
+          "maximum bytes in flight; a single larger frame is sent on its own (default: 512MiB)");
+    sopts("send-overflow", po::value<std::string>(&sendOverflowStr)->default_value("block"),
+          "when the in-flight limit is reached: 'block' the builder threads, or 'drop' the frame "
+          "after --send-block-timeout. Drops are counted and logged (default: block)");
+    sopts("send-block-timeout", po::value<int>(&sendBlockTimeoutMs)->default_value(1000),
+          "milliseconds to wait for space before dropping, with --send-overflow=drop (default: 1000)");
+    sopts("send-drain-timeout", po::value<int>(&sendDrainTimeoutMs)->default_value(10000),
+          "milliseconds allowed at shutdown for completed frames to be sent before they are "
+          "counted as abandoned (default: 10000)");
+    od.add(sendOd);
+
     po::variables_map vm;
 
     try {
@@ -950,35 +1382,43 @@ int main(int argc, char **argv)
             std::cout << "\n=== Example Usage ===" << std::endl;
             std::cout << "\nDEFAULT MODE: Reassembly-only (no frame building)" << std::endl;
             std::cout << "Framebuilding is OPTIONAL and must be explicitly enabled with --enable-framebuild=1" << std::endl;
+            std::cout << "--uri/-u still works as a deprecated alias for --recv-ejfat-uri." << std::endl;
 
             std::cout << "\n1. Default: Reassembly-only mode (raw frames to file):" << std::endl;
-            std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
-            std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
-            std::cout << "               --output-dir /data/raw \\" << std::endl;
-            std::cout << "               --prefix events --threads 4" << std::endl;
+            std::cout << "coda-fb --recv-ejfat-uri 'ejfats://token@cp1:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \\" << std::endl;
+            std::cout << "        --ip 192.168.1.100 --port 10000 \\" << std::endl;
+            std::cout << "        --output-dir /data/raw \\" << std::endl;
+            std::cout << "        --prefix events --threads 4" << std::endl;
 
             std::cout << "\n2. Enable framebuilding with file output (EVIO-6 aggregation, 2GB auto-rollover):" << std::endl;
-            std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
-            std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
-            std::cout << "               --enable-framebuild=1 \\" << std::endl;
-            std::cout << "               --fb-output-dir /data/frames \\" << std::endl;
-            std::cout << "               --fb-output-prefix aggregated \\" << std::endl;
-            std::cout << "               --fb-threads 4" << std::endl;
+            std::cout << "coda-fb --recv-ejfat-uri 'ejfats://token@cp1:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \\" << std::endl;
+            std::cout << "        --ip 192.168.1.100 --port 10000 \\" << std::endl;
+            std::cout << "        --enable-framebuild=1 \\" << std::endl;
+            std::cout << "        --fb-output-dir /data/frames \\" << std::endl;
+            std::cout << "        --fb-output-prefix aggregated \\" << std::endl;
+            std::cout << "        --fb-threads 4" << std::endl;
 
             std::cout << "\n3. Enable framebuilding with ET output:" << std::endl;
-            std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
-            std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
-            std::cout << "               --enable-framebuild=1 \\" << std::endl;
-            std::cout << "               --et-file /tmp/et_sys_pagg \\" << std::endl;
-            std::cout << "               --fb-threads 4" << std::endl;
+            std::cout << "coda-fb --recv-ejfat-uri 'ejfats://token@cp1:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \\" << std::endl;
+            std::cout << "        --ip 192.168.1.100 --port 10000 \\" << std::endl;
+            std::cout << "        --enable-framebuild=1 \\" << std::endl;
+            std::cout << "        --et-file /tmp/et_sys_pagg \\" << std::endl;
+            std::cout << "        --fb-threads 4" << std::endl;
 
             std::cout << "\n4. Enable framebuilding with dual output (ET + file backup):" << std::endl;
-            std::cout << "e2sar_receiver -u 'ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000' \\" << std::endl;
-            std::cout << "               --ip 192.168.1.100 --port 10000 \\" << std::endl;
-            std::cout << "               --enable-framebuild=1 \\" << std::endl;
-            std::cout << "               --et-file /tmp/et_sys_pagg \\" << std::endl;
-            std::cout << "               --fb-output-dir /data/backup \\" << std::endl;
-            std::cout << "               --fb-output-prefix backup" << std::endl;
+            std::cout << "coda-fb --recv-ejfat-uri 'ejfats://token@cp1:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \\" << std::endl;
+            std::cout << "        --ip 192.168.1.100 --port 10000 \\" << std::endl;
+            std::cout << "        --enable-framebuild=1 \\" << std::endl;
+            std::cout << "        --et-file /tmp/et_sys_pagg \\" << std::endl;
+            std::cout << "        --fb-output-dir /data/backup \\" << std::endl;
+            std::cout << "        --fb-output-prefix backup" << std::endl;
+
+            std::cout << "\n5. Build frames and forward each one to a second load balancer:" << std::endl;
+            std::cout << "coda-fb --recv-ejfat-uri 'ejfats://token1@cp1:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \\" << std::endl;
+            std::cout << "        --send-ejfat-uri 'ejfats://token2@cp2:18347/lb/7?data=10.0.1.1&sync=10.0.1.1:19010' \\" << std::endl;
+            std::cout << "        --ip 192.168.1.100 --port 10000 \\" << std::endl;
+            std::cout << "        --enable-framebuild=1 --expected-streams 3 \\" << std::endl;
+            std::cout << "        --send-data-id 1 --send-queue-frames 256 --send-overflow block" << std::endl;
 
             return 0;
         }
@@ -987,6 +1427,22 @@ int main(int argc, char **argv)
     } catch (const boost::program_options::error &e) {
         std::cerr << "Command line error: " << e.what() << std::endl;
         return -1;
+    }
+
+    // Receive URI: --recv-ejfat-uri, or the deprecated --uri/-u with the same meaning
+    std::string recvUriOption{"--recv-ejfat-uri"};
+    if (vm.count("recv-ejfat-uri") && vm.count("uri")) {
+        std::cerr << "Use either --recv-ejfat-uri or the deprecated --uri/-u, not both" << std::endl;
+        return -1;
+    }
+    if (!vm.count("recv-ejfat-uri")) {
+        if (!vm.count("uri")) {
+            std::cerr << "--recv-ejfat-uri is required: the instance URI of the load balancer to receive from" << std::endl;
+            return -1;
+        }
+        recvUriStr = legacyUriStr;
+        recvUriOption = "--uri";
+        std::cerr << "WARNING: --uri/-u is deprecated, use --recv-ejfat-uri (same meaning)" << std::endl;
     }
 
     // Validate parameters
@@ -1002,17 +1458,24 @@ int main(int argc, char **argv)
 
     validate = !vm["novalidate"].as<bool>();
 
+    const bool forwarding = !sendUriStr.empty();
+
     // Validate based on framebuilding mode
 #ifdef ENABLE_FRAME_BUILDER
+    if (forwarding && !enableFramebuild) {
+        std::cerr << "ERROR: --send-ejfat-uri forwards built frames and requires --enable-framebuild=1" << std::endl;
+        return -1;
+    }
     if (enableFramebuild) {
         // Frame building mode - check that at least one output is enabled
         bool hasETOutput = !etFile.empty();
         bool hasFileOutput = !fbOutputDir.empty();
 
-        if (!hasETOutput && !hasFileOutput) {
+        if (!hasETOutput && !hasFileOutput && !forwarding) {
             std::cerr << "ERROR: Frame builder mode requires at least one output:" << std::endl;
             std::cerr << "  ET output: specify --et-file" << std::endl;
             std::cerr << "  File output: specify --fb-output-dir" << std::endl;
+            std::cerr << "  Forwarding to a second load balancer: specify --send-ejfat-uri" << std::endl;
             return -1;
         }
     } else {
@@ -1024,12 +1487,70 @@ int main(int argc, char **argv)
         }
     }
 #else
+    if (forwarding) {
+        std::cerr << "ERROR: --send-ejfat-uri requires the frame builder, which this build does not "
+                  << "include (the ET library was not found at build time)" << std::endl;
+        return -1;
+    }
     // Without frame builder compiled in, always require direct file output
     if (outputDir.empty()) {
         std::cerr << "Output directory (--output-dir) is required (frame builder not available)" << std::endl;
         return -1;
     }
 #endif
+
+    // Validate forwarding parameters
+#ifdef ENABLE_FRAME_BUILDER
+    codafb::OverflowPolicy sendOverflow{codafb::OverflowPolicy::Block};
+#endif
+    if (forwarding) {
+        std::string bad;
+        if (sendQueueFrames < 1 || sendQueueFrames > 65534)
+            bad = "--send-queue-frames must be between 1 and 65534 (E2SAR's queue limit)";
+        else if (sendQueueBytes < 1)
+            bad = "--send-queue-bytes must be at least 1";
+        else if (sendEventOffset < 1)
+            bad = "--send-event-offset must be >= 1: E2SAR treats event number 0 as 'next sequential number'";
+        else if (sendLbHdrVersion != 2 && sendLbHdrVersion != 3)
+            bad = "--send-lbhdr-version must be 2 or 3";
+        else if (sendSockets < 1 || sendSockets > 128)
+            bad = "--send-sockets must be between 1 and 128";
+        else if (sendBlockTimeoutMs < 0 || sendDrainTimeoutMs < 0)
+            bad = "--send-block-timeout and --send-drain-timeout must not be negative";
+#ifdef ENABLE_FRAME_BUILDER
+        else if (!codafb::parseOverflowPolicy(sendOverflowStr, sendOverflow))
+            bad = "--send-overflow must be 'block' or 'drop'";
+#endif
+        if (!bad.empty()) {
+            std::cerr << "ERROR: " << bad << std::endl;
+            return -1;
+        }
+    }
+
+    // Parse both URIs before touching the network, so that a typo in either
+    // one fails before anything is registered.
+    auto recvUriRes = codafb::parseEjfatUri(recvUriOption, recvUriStr, codafb::UriRole::Receive, withCP, preferV6);
+    if (recvUriRes.has_error()) {
+        std::cerr << "ERROR: " << recvUriRes.error().message() << std::endl;
+        return -1;
+    }
+    const EjfatURI recvUri = recvUriRes.value();
+
+    std::optional<EjfatURI> sendUri;
+    if (forwarding) {
+        auto sendUriRes = codafb::parseEjfatUri("--send-ejfat-uri", sendUriStr, codafb::UriRole::Send,
+                                                !sendNoCP, preferV6, sendIPv6);
+        if (sendUriRes.has_error()) {
+            std::cerr << "ERROR: " << sendUriRes.error().message() << std::endl;
+            return -1;
+        }
+        sendUri = sendUriRes.value();
+        auto distinct = codafb::checkDistinctLoadBalancers(recvUri, *sendUri);
+        if (distinct.has_error()) {
+            std::cerr << "ERROR: " << distinct.error().message() << std::endl;
+            return -1;
+        }
+    }
 
     // Validate output directory if needed (reassembly-only mode)
 #ifdef ENABLE_FRAME_BUILDER
@@ -1083,6 +1604,9 @@ int main(int argc, char **argv)
         if (hasFileOutput) {
             std::cout << "  File output: " << fbOutputDir << "/" << fbOutputPrefix << "_*.evio" << std::endl;
         }
+        if (forwarding) {
+            std::cout << "  Forwarding: " << codafb::describeEjfatUri(*sendUri) << std::endl;
+        }
         std::cout << "  Builder Threads: " << fbThreads << std::endl;
         std::cout << "  Expected Streams: " << expectedStreams << std::endl;
     } else {
@@ -1116,15 +1640,158 @@ int main(int argc, char **argv)
     }
 #endif
 
-    try {
-        // Parse EJFAT URI
-        EjfatURI::TokenType tokenType{EjfatURI::TokenType::instance};
-        auto uri_result = EjfatURI::getFromString(ejfat_uri, tokenType, preferV6);
-        if (uri_result.has_error()) {
-            std::cerr << "Invalid EJFAT URI: " << uri_result.error().message() << std::endl;
+    pipelineStats.health.senderEnabled = forwarding;
+
+    // Metrics first: a port conflict fails before anything is registered, and
+    // readiness is visible (as 0) while startup is still in progress.
+    if (metricsPort != 0) {
+#ifdef ENABLE_FRAME_BUILDER
+        const bool building = enableFramebuild;
+#else
+        const bool building = false;
+#endif
+        metricsEndpointPtr = new codafb::MetricsEndpoint([building, forwarding] {
+            return renderMetrics(building, forwarding);
+        });
+        std::string err = metricsEndpointPtr->start(metricsBind, metricsPort);
+        if (!err.empty()) {
+            std::cerr << "ERROR: " << err << " (--metrics-port/--metrics-bind)" << std::endl;
+            delete metricsEndpointPtr;
+            metricsEndpointPtr = nullptr;
             return -1;
         }
-        auto uri = uri_result.value();
+        std::cout << "Prometheus metrics: http://" << metricsBind << ":" << metricsEndpointPtr->port()
+                  << "/metrics" << std::endl;
+    }
+
+    std::thread statsThread;
+
+    // Startup order is the reverse of the data flow: the sender to LB #2 and
+    // the frame builder are ready before this worker registers on LB #1, so no
+    // data arrives before it can be handled, and a failure on the send side
+    // leaves nothing registered anywhere. Every failure path undoes what was
+    // already set up (cleanupAfterFailure()).
+    try {
+#ifdef ENABLE_FRAME_BUILDER
+        // ---- 1. Sender to LB #2 -------------------------------------------------------
+        if (forwarding) {
+            std::cout << "\nInitializing frame forwarding to the send LB: "
+                      << codafb::describeEjfatUri(*sendUri) << std::endl;
+
+            u_int32_t srcId = sendSrcId;
+            if (srcId == 0) {
+                auto hostname = NetUtil::getHostName();
+                srcId = fnv1a32(hostname.has_error() ? std::string("coda-fb") : hostname.value());
+                if (srcId == 0) srcId = 1;
+            }
+
+            codafb::E2SARFrameTransport::Config tcfg;
+            tcfg.dataId = sendDataId;
+            tcfg.eventSrcId = srcId;
+            tcfg.sflags.useCP = !sendNoCP;
+            tcfg.sflags.mtu = sendMtu;
+            tcfg.sflags.numSendSockets = sendSockets;
+            tcfg.sflags.sndSocketBufSize = sendBufSize;
+            tcfg.sflags.rateGbps = sendRateGbps;
+            tcfg.sflags.dpV6 = sendIPv6;
+            tcfg.sflags.lbHdrVersion = static_cast<u_int8_t>(sendLbHdrVersion);
+            tcfg.sflags.warmUpMs = sendWarmUpMs;
+            // FrameSender bounds what is in flight; E2SAR's own queue only has to hold that much.
+            tcfg.sflags.eventQueueSize = std::max<size_t>(tcfg.sflags.eventQueueSize, sendQueueFrames + 1);
+            tcfg.senderAddresses = sendSenderIPs;
+            tcfg.validateCert = validate;
+            tcfg.useHostAddress = preferV6;
+
+            auto transport = codafb::E2SARFrameTransport::create(*sendUri, tcfg);
+            if (transport.has_error()) {
+                std::cerr << "\nERROR: unable to initialize forwarding to the send LB: "
+                          << transport.error().message() << std::endl;
+                cleanupAfterFailure();
+                return -1;
+            }
+            sendTransportPtr = transport.value().release();
+
+            codafb::FrameSenderConfig scfg;
+            scfg.maxInFlightFrames = sendQueueFrames;
+            scfg.maxInFlightBytes = sendQueueBytes;
+            scfg.overflow = sendOverflow;
+            scfg.dropAfter = std::chrono::milliseconds(sendBlockTimeoutMs);
+            scfg.eventNumOffset = sendEventOffset;
+            frameSenderPtr = new codafb::FrameSender(*sendTransportPtr, scfg, pipelineStats.send);
+            pipelineStats.health.senderReady = true;
+
+            std::cout << "Forwarding ready: data id " << sendDataId
+                      << ", source id 0x" << std::hex << srcId << std::dec
+                      << ", outbound event number = frame number + " << sendEventOffset << std::endl;
+            std::cout << "  MTU " << sendTransportPtr->mtu() << " (" << sendTransportPtr->maxPayloadPerPacket()
+                      << " payload bytes/packet)";
+            if (!sendTransportPtr->interface().empty())
+                std::cout << " via " << sendTransportPtr->interface();
+            std::cout << ", " << sendSockets << " send sockets"
+                      << ", rate " << (sendRateGbps > 0 ? std::to_string(sendRateGbps) + " Gbps" : std::string("unlimited"))
+                      << std::endl;
+            std::cout << "  In flight at most " << sendQueueFrames << " frames / "
+                      << fmtBytes(static_cast<double>(sendQueueBytes)) << ", overflow policy '"
+                      << codafb::toString(sendOverflow) << "'"
+                      << (sendOverflow == codafb::OverflowPolicy::Drop
+                          ? " after " + std::to_string(sendBlockTimeoutMs) + " ms" : std::string())
+                      << ", " << (sendPartial ? "complete and partial" : "complete") << " frames forwarded"
+                      << std::endl;
+            if (sendNoCP)
+                std::cout << "  WARNING: --send-nocp: no sender registration and no sync packets" << std::endl;
+        }
+
+        // ---- 2. Frame builder (or the reassembly-only output file) --------------------
+        if (enableFramebuild) {
+            std::cout << "\nInitializing frame builder..." << std::endl;
+
+            frameBuilderPtr = new e2sar::FrameBuilder(
+                etFile,
+                etHost,
+                etPort,
+                fbOutputDir,
+                fbOutputPrefix,
+                fbThreads,
+                etEventSize,
+                timestampSlop,
+                frameTimeout,
+                expectedStreams,  // Number of expected data streams for aggregation
+                verboseFrameInfo  // Enable verbose logging
+            );
+            frameBuilderPtr->setStatistics(&pipelineStats.build);
+            frameBuilderPtr->setFrameSender(frameSenderPtr, sendPartial);
+
+            if (!frameBuilderPtr->start()) {
+                std::cerr << "Failed to start frame builder" << std::endl;
+                cleanupAfterFailure();
+                return -1;
+            }
+            pipelineStats.health.builderReady = true;
+
+            std::cout << "Frame builder started successfully\n" << std::endl;
+        } else
+#endif
+        {
+            // Reassembly-only mode - create direct output file
+            std::ostringstream outputFileName;
+            outputFileName << filePrefix << fileExtension;
+            bfs::path outputFilePath{outputDir};
+            outputFilePath /= outputFileName.str();
+
+            mode_t fileMode{S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH};
+            globalOutputFd = open(outputFilePath.c_str(), O_WRONLY|O_CREAT|O_TRUNC, fileMode);
+            if (globalOutputFd < 0)
+            {
+                std::cerr << "Unable to create output file " << outputFilePath << ": " << strerror(errno) << std::endl;
+                cleanupAfterFailure();
+                return -1;
+            }
+
+            std::cout << "Reassembly-only mode: Writing all frames to: " << outputFilePath << "\n" << std::endl;
+        }
+
+        // ---- 3. Receiver on LB #1 ---------------------------------------------------------
+        std::cout << "Receive LB: " << codafb::describeEjfatUri(recvUri) << std::endl;
 
         // Configure reassembler
         Reassembler::ReassemblerFlags rflags;
@@ -1155,6 +1822,7 @@ int main(int argc, char **argv)
             std::string localIP = getLocalHostIP(preferV6);
             if (localIP.empty()) {
                 std::cerr << "Failed to auto-detect local host IP address" << std::endl;
+                cleanupAfterFailure();
                 return -1;
             }
             std::cout << "Auto-detected local host IP: " << localIP << std::endl;
@@ -1165,7 +1833,7 @@ int main(int argc, char **argv)
 
         // Create reassembler with multithreaded UDP reception
         if (coreList.size() > 0) {
-            reasPtr = new Reassembler(uri, data_ip, recvStartPort, coreList, rflags);
+            reasPtr = new Reassembler(recvUri, data_ip, recvStartPort, coreList, rflags);
             std::cout << "Reassembly threads: " << coreList.size() << " (CPU-pinned)" << std::endl;
             std::cout << "  CPU cores: ";
             for (size_t i = 0; i < coreList.size(); ++i) {
@@ -1174,7 +1842,7 @@ int main(int argc, char **argv)
             }
             std::cout << std::endl;
         } else {
-            reasPtr = new Reassembler(uri, data_ip, recvStartPort, numThreads, rflags);
+            reasPtr = new Reassembler(recvUri, data_ip, recvStartPort, numThreads, rflags);
             std::cout << "Reassembly threads: " << numThreads << " (parallel UDP receivers)" << std::endl;
         }
 
@@ -1184,80 +1852,19 @@ int main(int argc, char **argv)
         // Register and start receiving
         auto prepareResult = prepareToReceive(*reasPtr);
         if (prepareResult.has_error()) {
-            std::cerr << "Failed to prepare receiver: " << prepareResult.error().message() << std::endl;
-            ctrlCHandler(0);
+            std::cerr << "Failed to prepare receiver: "
+                      << codafb::redactCredentials(prepareResult.error().message()) << std::endl;
+            cleanupAfterFailure();
             return -1;
         }
+        pipelineStats.health.receiverReady = true;
+        // all E2SAR objects exist now; publish them to the metrics renderer
+        e2sarStatsReady.store(true, std::memory_order_release);
 
         std::cout << "Receiver started successfully. Press Ctrl+C to stop." << std::endl;
 
-        // Initialize frame builder (only if enabled)
-#ifdef ENABLE_FRAME_BUILDER
-        if (enableFramebuild) {
-            std::cout << "\nInitializing frame builder..." << std::endl;
-
-            frameBuilderPtr = new e2sar::FrameBuilder(
-                etFile,
-                etHost,
-                etPort,
-                fbOutputDir,
-                fbOutputPrefix,
-                fbThreads,
-                etEventSize,
-                timestampSlop,
-                frameTimeout,
-                expectedStreams,  // Number of expected data streams for aggregation
-                verboseFrameInfo  // Enable verbose logging
-            );
-
-            if (!frameBuilderPtr->start()) {
-                std::cerr << "Failed to start frame builder" << std::endl;
-                delete frameBuilderPtr;
-                frameBuilderPtr = nullptr;
-                ctrlCHandler(0);
-                return -1;
-            }
-
-            std::cout << "Frame builder started successfully\n" << std::endl;
-        } else {
-            // Reassembly-only mode - create direct output file
-            std::ostringstream outputFileName;
-            outputFileName << filePrefix << fileExtension;
-            bfs::path outputFilePath{outputDir};
-            outputFilePath /= outputFileName.str();
-
-            mode_t fileMode{S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH};
-            globalOutputFd = open(outputFilePath.c_str(), O_WRONLY|O_CREAT|O_TRUNC, fileMode);
-            if (globalOutputFd < 0)
-            {
-                std::cerr << "Unable to create output file " << outputFilePath << ": " << strerror(errno) << std::endl;
-                performFinalCleanup();
-                return -1;
-            }
-
-            std::cout << "Reassembly-only mode: Writing all frames to: " << outputFilePath << "\n" << std::endl;
-        }
-#else
-        // Without frame builder compiled in, always use direct file output
-        std::ostringstream outputFileName;
-        outputFileName << filePrefix << fileExtension;
-        bfs::path outputFilePath{outputDir};
-        outputFilePath /= outputFileName.str();
-
-        mode_t fileMode{S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH};
-        globalOutputFd = open(outputFilePath.c_str(), O_WRONLY|O_CREAT|O_TRUNC, fileMode);
-        if (globalOutputFd < 0)
-        {
-            std::cerr << "Unable to create output file " << outputFilePath << ": " << strerror(errno) << std::endl;
-            performFinalCleanup();
-            return -1;
-        }
-
-        std::cout << "Writing all events to: " << outputFilePath << std::endl;
-#endif
-
         // Start statistics reporting thread
-        boost::thread statsThread(&statsReportingThread, reasPtr);
+        statsThread = std::thread(statsReportingThread);
 
         // Start frame reception and writing
         auto result = receiveAndWriteFrames(reasPtr, globalOutputFd, frameBuilderPtr);
@@ -1266,16 +1873,22 @@ int main(int argc, char **argv)
             std::cerr << "Error in frame reception: " << result.error().message() << std::endl;
         }
 
+        // The reporting thread reads E2SAR objects that shutdown tears down
+        stopStatsReporting(statsThread);
+        shutdownPipeline(reasPtr, frameBuilderPtr, sendDrainTimeoutMs);
+
         // Normal cleanup
         performFinalCleanup();
 
     } catch (const E2SARException &e) {
-        std::cerr << "E2SAR error: " << static_cast<std::string>(e) << std::endl;
-        performFinalCleanup();
+        std::cerr << "E2SAR error: " << codafb::redactCredentials(static_cast<std::string>(e)) << std::endl;
+        stopStatsReporting(statsThread);
+        cleanupAfterFailure();
         return -1;
     } catch (const std::exception &e) {
-        std::cerr << "Standard exception: " << e.what() << std::endl;
-        performFinalCleanup();
+        std::cerr << "Standard exception: " << codafb::redactCredentials(e.what()) << std::endl;
+        stopStatsReporting(statsThread);
+        cleanupAfterFailure();
         return -1;
     }
 

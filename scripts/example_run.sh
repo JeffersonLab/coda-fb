@@ -74,7 +74,7 @@ echo
 
 # Run the receiver
 exec "$RECEIVER_EXE" \
-    --uri "$EJFAT_URI" \
+    --recv-ejfat-uri "$EJFAT_URI" \
     --ip "$RECEIVER_IP" \
     --port "$RECEIVER_PORT" \
     --output-dir "$OUTPUT_DIR" \

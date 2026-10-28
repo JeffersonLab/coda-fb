@@ -50,7 +50,7 @@ script before running it.
 
 | Variable | Default | Passed as |
 |---|---|---|
-| `EJFAT_URI` | `ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000` | `--uri` |
+| `EJFAT_URI` | `ejfat://token@ctrl-plane:18347/lb/1?data=192.168.1.100:10000` | `--recv-ejfat-uri` |
 | `RECEIVER_IP` | `192.168.1.100` | `--ip` |
 | `RECEIVER_PORT` | `10000` | `--port` |
 | `OUTPUT_DIR` | `/tmp/e2sar_frames` | `--output-dir` (created if missing) |

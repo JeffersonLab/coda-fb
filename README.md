@@ -1,15 +1,17 @@
 # CODA Frame Builder
 
-Multi-threaded frame aggregator for Jefferson Lab CODA DAQ. Receives UDP packets from EJFAT load
-balancers, reassembles frames, aggregates matching frames from multiple data streams, and outputs
-EVIO-6 format to ET systems or files.
+Multi-threaded frame aggregator for Jefferson Lab CODA DAQ. Receives UDP packets from an EJFAT load
+balancer, reassembles frames, aggregates matching frames from multiple data streams, and outputs
+EVIO-6 format to ET systems, files, and/or a second EJFAT load balancer.
 
 ```
-UDP from EJFAT LB
+UDP from EJFAT LB #1            (--recv-ejfat-uri: coda-fb is a worker here)
   → E2SAR Reassembler   (N receiver threads on ports P .. P+N-1)
   → reception loop      (validate EVIO payload, extract timestamp / ROC id)
   → FrameBuilder        (M builder threads, per-stream FIFOs, alignment)
-  → EVIO-6 records      → ET system and/or .evio files (2 GB rollover)
+  → EVIO-6 records      → FrameSender → E2SAR Segmenter → UDP to EJFAT LB #2
+                          (--send-ejfat-uri: coda-fb is a sender there)
+                        → ET system and/or .evio files (2 GB rollover)
 ```
 
 ## Dependencies
@@ -80,7 +82,7 @@ installing E2SAR, ET or the Boost/gRPC stack there:
 ./docker/build.sh --tag coda-fb:v1.0.0
 
 docker run -d --network host -v /data/frames:/data \
-  -e EJFAT_URI='ejfat://token@cp-host:18347/lb/1?data=10.0.0.5:10000' \
+  -e RECV_EJFAT_URI='ejfats://token@cp-host:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \
   -e RECEIVER_IP=10.0.0.5 -e THREADS=4 -e EXPECTED_STREAMS=3 \
   coda-fb:v1.0.0
 ```
@@ -97,9 +99,12 @@ for the full parameter list, ET options, and registry/tarball deployment.
 explicitly with `--enable-framebuild=1` (it takes a value — a bare `--enable-framebuild` will
 consume the next argument).
 
+`--recv-ejfat-uri` is the **instance URI** of the load balancer to receive from (the one returned
+when it was reserved). It replaces `--uri`/`-u`; see [Migrating from `--uri`](#migrating-from---uri).
+
 **Reassembly-only (default): raw frames concatenated into one file**
 ```bash
-coda-fb --uri 'ejfat://token@host:18347/lb/1?data=192.168.1.100:10000' \
+coda-fb --recv-ejfat-uri 'ejfats://token@host:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \
   --ip 192.168.1.100 --port 10000 \
   --threads 4 --output-dir /data/raw --prefix events --extension .bin
 ```
@@ -107,7 +112,7 @@ Writes a single file `/data/raw/events.bin` (truncated at startup).
 
 **Frame building to file**
 ```bash
-coda-fb --uri 'ejfat://...' --ip 192.168.1.100 --port 10000 \
+coda-fb --recv-ejfat-uri 'ejfats://...' --ip 192.168.1.100 --port 10000 \
   --enable-framebuild=1 --fb-output-dir /data/frames \
   --fb-threads 8 --threads 4 --expected-streams 8
 ```
@@ -115,26 +120,48 @@ Writes `/data/frames/frames_thread<N>_file<MMMM>.evio`, one file series per buil
 
 **Frame building to ET**
 ```bash
-coda-fb --uri 'ejfat://...' --ip 192.168.1.100 --port 10000 \
+coda-fb --recv-ejfat-uri 'ejfats://...' --ip 192.168.1.100 --port 10000 \
   --enable-framebuild=1 --et-file /tmp/et_sys --et-host localhost \
   --fb-threads 8 --threads 4
 ```
 
 **Dual output (ET + file backup)**
 ```bash
-coda-fb --uri 'ejfat://...' --ip 192.168.1.100 --port 10000 \
+coda-fb --recv-ejfat-uri 'ejfats://...' --ip 192.168.1.100 --port 10000 \
   --enable-framebuild=1 --et-file /tmp/et_sys \
   --fb-output-dir /data/backup --fb-output-prefix backup
 ```
 
 **Current test run for a 3-ROC configuration**
 ```bash
-./coda-fb -u "$EJFAT_URI" --novalidate --ip 129.57.109.231 --threads 4 \
+./coda-fb --recv-ejfat-uri "$EJFAT_URI" --novalidate --ip 129.57.109.231 --threads 4 \
   --enable-framebuild=1 --expected-streams=3 --fb-threads 1 --fb-output-dir "$CODA_DATA"
 ```
 
-Stop with `Ctrl+C`; the handler deregisters from the EJFAT load balancer, drains the builder
-threads, and prints final statistics.
+**Frame building with forwarding to a second load balancer** (plus a file copy)
+```bash
+coda-fb --recv-ejfat-uri 'ejfats://token1@cp1:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \
+  --send-ejfat-uri 'ejfats://token2@cp2:18347/lb/7?data=10.0.1.1&sync=10.0.1.1:19010' \
+  --ip 192.168.1.100 --port 10000 --threads 4 \
+  --enable-framebuild=1 --expected-streams 3 --fb-threads 1 \
+  --fb-output-dir /data/frames \
+  --send-data-id 1 --send-queue-frames 256 --send-overflow block
+```
+Each built frame is sent to LB #2 as one E2SAR event as soon as it is built. `--fb-output-dir` /
+`--et-file` are optional when forwarding. See
+[Forwarding built frames](#forwarding-built-frames-to-a-second-load-balancer).
+
+Stop with `Ctrl+C` (SIGINT); shutdown deregisters from LB #1 first, drains the builder threads and
+the frames being forwarded, removes the sender registration from LB #2, and prints final
+statistics.
+
+#### Migrating from `--uri`
+
+`--uri`/`-u` is **retained as a deprecated alias** of `--recv-ejfat-uri`: it means exactly the same
+thing, prints a deprecation warning, and cannot be combined with `--recv-ejfat-uri`. Existing
+command lines keep working unchanged. To migrate, rename `--uri`/`-u` to `--recv-ejfat-uri`. In
+the container, `EJFAT_URI` is likewise kept as an alias of `RECV_EJFAT_URI`. There is no implicit
+fallback in the other direction: forwarding is enabled only by an explicit `--send-ejfat-uri`.
 
 #### Options
 
@@ -142,7 +169,8 @@ threads, and prints final statistics.
 
 | Option | Default | Description |
 |---|---|---|
-| `--uri`, `-u` | — | EJFAT control-plane URI. The only strictly required option. |
+| `--recv-ejfat-uri` | — | Instance URI of the load balancer to receive from (LB #1). The only strictly required option. |
+| `--uri`, `-u` | — | Deprecated alias of `--recv-ejfat-uri`; mutually exclusive with it. |
 
 Exactly one of `--ip` or `--autoip` must also be given.
 
@@ -155,7 +183,7 @@ Exactly one of `--ip` or `--autoip` must also be given.
 | `--port`, `-p` | `10000` | **Starting** UDP port. Receiver thread *i* listens on `port + i`, so the range is `port .. port + threads - 1`. |
 | `--ipv6`, `-6` | off | Prefer IPv6 for control-plane connections. |
 | `--novalidate`, `-v` | off | Do **not** validate TLS certificates. (`-v` is *not* a verbosity flag.) |
-| `--withcp`, `-c` | on | Enable control-plane interaction. Currently always on — see [Known quirks](#known-quirks). |
+| `--withcp`, `-c` | on | Control-plane interaction with LB #1. `--withcp=0` disables it — debugging only: no worker registration, and packets must carry LB headers. A bare `--withcp` still means on. |
 
 **Mode**
 
@@ -183,6 +211,30 @@ Exactly one of `--ip` or `--autoip` must also be given.
 | `--fb-output-prefix` | `frames` | File name prefix → `<prefix>_thread<N>_file<MMMM>.evio`. |
 | `--fb-threads` | `1` | Parallel builder threads. Must be 1–32. |
 
+**Forwarding to a second load balancer** (requires `--enable-framebuild=1`)
+
+| Option | Default | Description |
+|---|---|---|
+| `--send-ejfat-uri` | *(empty)* | Instance URI of LB #2. Empty disables forwarding. Must have `data=`; with the control plane also `sync=` (IPv4), a token and an LB id. Must not name the same LB instance as `--recv-ejfat-uri`. |
+| `--send-data-id` | `1` | E2SAR data id carried by every forwarded frame. Must differ between coda-fb instances whose frames meet in one downstream reassembler. |
+| `--send-src-id` | `0` | E2SAR event source id in sync packets, unique per sender. `0` derives it (FNV-1a) from the host name; the value is printed at startup. |
+| `--send-sender-ip` | auto | Address(es) registered as sender with LB #2. Default: the local address that routes to its data address. |
+| `--send-event-offset` | `1` | Outbound event number = offset + built frame number. Must be ≥ 1 (E2SAR reserves 0). |
+| `--send-partial-frames` | `1` | Also forward partial frames (fewer streams than expected). ET/file always get them. |
+| `--send-mtu` | `1500` | MTU incl. IP/UDP/LB/RE headers; `0` = outgoing interface MTU. |
+| `--send-sockets` | `4` | Send sockets/threads (spreads packets over LB ports). |
+| `--send-bufsize` | `3145728` | Send socket buffer (bounded by `net.core.wmem_max`). |
+| `--send-rate` | `-1` | Rate limit in Gbps; negative = unlimited. |
+| `--send-ipv6` | off | Send to the IPv6 data address of LB #2. |
+| `--send-lbhdr-version` | `2` | LB header version (2 or 3). |
+| `--send-warmup` | `1000` | ms of sync packets before the first frame. |
+| `--send-nocp` | off | Debugging only: no sender registration, no sync packets. |
+| `--send-queue-frames` | `256` | Max frames in flight (handed to E2SAR, not yet released). 1–65534. |
+| `--send-queue-bytes` | 512 MiB | Max bytes in flight. A single larger frame is sent on its own. |
+| `--send-overflow` | `block` | At the limit: `block` the builder threads, or `drop` the frame after `--send-block-timeout`. |
+| `--send-block-timeout` | `1000` | ms to wait for space before dropping (`drop` policy only). |
+| `--send-drain-timeout` | `10000` | ms allowed at shutdown for completed frames to be sent. |
+
 **Aggregation tuning**
 
 | Option | Default | Description |
@@ -203,6 +255,8 @@ Exactly one of `--ip` or `--autoip` must also be given.
 | `--bufsize`, `-b` | `3145728` | UDP socket receive buffer size in bytes (3 MB). |
 | `--timeout` | `500` | E2SAR event reassembly timeout in milliseconds. |
 | `--report-interval` | `5000` | Statistics reporting interval in milliseconds. |
+| `--metrics-port` | `0` | Serve Prometheus metrics at `http://<metrics-bind>:<port>/metrics`; `0` disables. See [Statistics](#statistics). |
+| `--metrics-bind` | `127.0.0.1` | Address the metrics endpoint listens on. The default is reachable from this host only; use `0.0.0.0` or the host address for a remote Prometheus. |
 | `--help`, `-h` | — | Show options and built-in examples. |
 
 ### evio_event_parser (Validator)
@@ -266,17 +320,162 @@ Note that aggregation keys on the **reassembler's event number**, not on the pay
 even though parts of the API still call this value a timestamp. The payload timestamp is carried
 through into the EVIO-6 output.
 
+## Forwarding built frames to a second load balancer
+
+With `--send-ejfat-uri`, each built frame is forwarded to a second EJFAT load balancer, on the
+fly, by an E2SAR `Segmenter`:
+
+```
+LB #1 → Reassembler → reception loop → FrameBuilder ──► FrameSender ──► Segmenter ──► LB #2
+                                                     └─► ET / file (unchanged)
+```
+
+**What is sent.** Exactly the serialized EVIO-6 record that goes to ET (and to the file, after
+its 56-byte file header): one record = one E2SAR event, fragmented by E2SAR into MTU-sized
+packets. Incoming packets and individual stream slices are never forwarded. A downstream E2SAR
+reassembler reconstructs the record byte for byte. The buffer is shared between the sender and
+ET/file output, so no copy is made; it is freed when its last user (normally E2SAR's send
+callback) releases it.
+
+**Which frames.** A frame is forwarded once, when its builder thread serializes it, before ET and
+file output. That includes partial frames (timeout or stream misalignment) unless
+`--send-partial-frames=0`, in which case they are counted as *partial not forwarded*. Frames that
+never complete — still collecting slices at shutdown, or failing EVIO validation — are never
+sent; they are counted as *discarded at shutdown* or *build failed*.
+
+**Identifiers.**
+
+| E2SAR field | Value |
+|---|---|
+| RE header event number | `--send-event-offset` (default 1) + the builder's *corrected* event number, i.e. the frame number written in the record's time-slice segment. E2SAR's `addToSendQueue()` treats 0 as "next sequential number", which is why the offset must be ≥ 1. |
+| RE header data id | `--send-data-id` (default 1), the same for every frame from this instance. |
+| Sync header source id | `--send-src-id`, or a hash of the host name. |
+| LB header tick / entropy | Set by E2SAR (microsecond clock, random per-event entropy). |
+
+Corrected event numbers are unique per run with `--fb-threads 1` (the default) or when all streams
+start aligned. With several builder threads *and* misaligned streams, the per-thread correction
+factors can make two threads produce the same number; use a different `--send-data-id` per
+instance and keep `--fb-threads 1` if that matters downstream.
+
+**Startup** runs against the data flow, so that nothing arrives before it can be handled and a
+failure leaves nothing registered: (1) register as a sender on LB #2 (`LBManager::addSenders`,
+instance token) and start the `Segmenter` (sync warm-up, sockets, threads); (2) start the frame
+builder; (3) register as a worker on LB #1 and start receiving. If any step fails, the steps
+already done are undone in reverse — including removing the sender registration — and coda-fb
+exits non-zero.
+
+**Backpressure.** A frame is *in flight* from the moment the sender admits it until E2SAR's send
+callback releases its buffer. In-flight frames and bytes are bounded by `--send-queue-frames` and
+`--send-queue-bytes`. (E2SAR's own queue does not bound memory: its send thread moves events into
+an unbounded thread-pool queue.) At the limit:
+
+- `--send-overflow=block` (default): the builder thread waits. Pressure propagates to the builder
+  FIFOs and then to E2SAR's reassembly queue on LB #1, where losses show up as *Lost on enqueue*.
+  Time spent waiting is reported as *Blocked*.
+- `--send-overflow=drop`: the builder waits up to `--send-block-timeout` ms, then drops the frame,
+  counts it as *Dropped: overflow* and logs it (rate-limited). ET/file output still get the frame.
+
+The only retry is when E2SAR's queue reports full, which means the frame was *not* enqueued, so it
+cannot create a duplicate; retries are bounded by the same deadline and counted.
+
+**Send failures.** E2SAR 0.4.0rc1 calls the send callback whether or not `sendmsg()` succeeded and
+discards the per-event result, so failures are visible only per packet: *Packet send errors* in
+the report (E2SAR's send `errCnt`, with the last `errno`). UDP gives no delivery confirmation;
+*Released by E2SAR* means E2SAR finished sending, **not** that LB #2 or a downstream worker
+received the frame.
+
+**Shutdown** (SIGINT, or SIGTERM in the container): deregister from LB #1 and stop receiving;
+stop the builder threads, each finishing and forwarding its current frame; wait until E2SAR has
+released every in-flight frame or `--send-drain-timeout` expires; stop the `Segmenter`; remove the
+sender registration from LB #2. A frame still waiting for queue space at the deadline is counted
+as *Dropped: shutdown*; frames still in flight are reported as *Abandoned at shutdown* (they may
+or may not have been sent), the `Segmenter` is then left running until process exit because it
+still uses their buffers, and the sender registration is removed anyway.
+
+**Operational notes.** The E2SAR send thread polls its queue without sleeping, so expect one core
+busy while forwarding. Raise `net.core.wmem_max` if you raise `--send-bufsize`.
+
+## Statistics
+
+coda-fb prints a report every `--report-interval` ms and a final one at exit. Rates are deltas over
+the last interval, divided by the measured interval (the final report averages over the run).
+Values marked `~` are estimated from histogram buckets; everything else is an exact count. All
+values are cumulative since process start: coda-fb has no run transition inside one process, so a
+new run (a new process) starts from zero.
+
+| Section | Source | Contents |
+|---|---|---|
+| Health | coda-fb | Readiness of receiver, builder and sender (`READY` once initialized, `NOT READY` during shutdown); age of the last received event, built frame, submitted frame and released frame. |
+| Receive: E2SAR reassembler | E2SAR `Reassembler::getStats()` | UDP packets and payload bytes received; events reassembled (includes events then lost on enqueue); events lost in reassembly (segments missing at `--timeout`); lost on enqueue (E2SAR queue full); bad headers; data socket errors; gRPC errors. |
+| Receive: reception loop | coda-fb | Events and bytes taken from E2SAR; `recvEvent` errors; payload validation errors (dropped); wrong-endian payloads (byte-swapped, kept). |
+| Frame building | coda-fb | Slices in; frames complete / partial / build failed / discarded at shutdown; serialized frames/s and bytes/s; slices and frames pending now; frame size, serialization time and assembly latency (first slice arrival → frame finalized) as ~p50/~p99; frames delivered to every enabled output; ET/file output errors. |
+| Forwarding | coda-fb | Offered = submitted + dropped (overflow, shutdown) + rejected; released by E2SAR; partial frames not forwarded; queue-full retries; in-flight frames and bytes vs capacity; submits that blocked and total blocked time; queue wait (offered → submitted) and E2SAR release latency (submitted → released) as ~p50/~p99; abandoned at shutdown (final report). |
+| Forwarding: E2SAR segmenter | E2SAR `Segmenter::getSendStats()/getSyncStats()` | Packets (with coda-fb's estimate `Σ ceil(frame bytes / payload per packet)` for comparison); packet send errors and last errno; sync messages and errors. Bytes sent on the wire are not exposed by E2SAR. |
+
+All counters are lock-free atomics (relaxed); a report reads them one at a time, so related values
+can be one in-flight update apart. Definitions and measurement boundaries are documented on each
+field in [`src/pipeline_stats.hpp`](src/pipeline_stats.hpp).
+
+### Prometheus
+
+With `--metrics-port N`, coda-fb serves the same statistics in Prometheus text format at
+`http://<metrics-bind>:N/metrics` (embedded Boost.Beast server on its own thread; a scrape only
+reads atomics and E2SAR's counters, it never takes a lock the data path uses). The endpoint is
+started before anything else, so a busy port fails startup before any LB registration, and it
+keeps serving through shutdown so readiness can be seen dropping to 0; it stops before the E2SAR
+objects are deleted.
+
+```bash
+coda-fb --recv-ejfat-uri "$LB1_URI" ... --metrics-port 9465 --metrics-bind 0.0.0.0
+curl -s http://daq-fb1:9465/metrics | grep coda_fb_send_frames_total
+```
+
+Metric names, types and labels, PromQL examples, a scrape configuration, alert rules and a
+Grafana dashboard are in [`doc/monitoring.md`](doc/monitoring.md) and
+[`doc/monitoring/`](doc/monitoring/). Families for a disabled stage (no frame building, no
+forwarding) are not exported, and E2SAR's own families appear once startup has created the
+reassembler and segmenter.
+
+## Testing
+
+```bash
+meson setup builddir && meson test -C builddir --print-errorlogs
+```
+
+Tests are not built by `meson compile`; `meson test` builds them. See [`test/README.md`](test/README.md)
+for what each test covers and for the procedure that needs live EJFAT load balancers.
+
 ## Known quirks
 
 These are current code behaviors, documented here so the flags are not misread:
 
-- **`--withcp` cannot be turned off.** It is declared as a boolean switch whose default is already
-  `true`, so passing it changes nothing and there is no CLI way to disable the control plane.
 - **`-v` means `--novalidate`,** not verbose. Use `--verbose-frames` or `--verbose-reassemble` for
   verbosity.
-- **`coda-fb --help` examples still use the old binary name** `e2sar_receiver`. The options shown
-  are correct; the program name is not.
+- **`--withcp=0` and `--send-nocp` are for debugging.** Without the control plane nothing is
+  registered with the load balancers.
 - **`--cores` silently overrides `--threads`.**
+
+## Behavior changes in the forwarding release
+
+Besides the new forwarding, these existing behaviors changed; each was needed for correct
+statistics or a safe shutdown:
+
+- `--uri`/`-u` is now a deprecated alias of `--recv-ejfat-uri`; `--withcp=0` now works.
+- Startup order is sender → frame builder → receiver (was receiver first), and every startup
+  failure undoes what was set up. A failed `openAndStart()` after a successful worker
+  registration now deregisters the worker.
+- With ET output enabled, *Frames Built* used to be counted twice per frame, and the reported
+  slice count was doubled. Both are fixed. As a consequence the EVIO-6 record number (word 1) is
+  now 1, 2, 3, … per builder thread in every output mode; with ET enabled it used to advance by 2.
+- Builder threads are now joined at shutdown (previously they were always detached after 1 s).
+  A built frame is still forwarded when shutdown begins; ET/file output keep their previous
+  shutdown checks.
+- Timeout bookkeeping for frames finalized from lagging streams is now released (it used to leak
+  one entry per such frame), and the startup entries are re-keyed to corrected event numbers.
+- The final statistics used to say "Reassembly-Only" in frame-building mode and could be one
+  report interval stale; rates were averages since process start labelled as current rates, and
+  MiB were labelled MB.
+- Error messages and the container log no longer print EJFAT tokens.
 
 ## License
 

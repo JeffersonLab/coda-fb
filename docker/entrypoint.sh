@@ -40,7 +40,8 @@ for _a in "$@"; do
     esac
 done
 
-# Raw mode: if the caller passes --uri/-u themselves, the command line is
+# Raw mode: if the caller passes --recv-ejfat-uri (or the deprecated --uri/-u)
+# themselves, the command line is
 # authoritative and the environment is not consulted for coda-fb flags. This is
 # how container runtimes that pass flags rather than environment variables
 # (Shifter, plain srun) are expected to invoke the image. RUN_ET_START and
@@ -48,15 +49,35 @@ done
 RAW_MODE=0
 for _a in "$@"; do
     case "$_a" in
-        -u|--uri|--uri=*) RAW_MODE=1; break ;;
+        -u|--uri|--uri=*|--recv-ejfat-uri|--recv-ejfat-uri=*) RAW_MODE=1; break ;;
     esac
 done
 
 # ---------------------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------------------
-# Required
+# Required: instance URI of the load balancer to receive from (LB #1).
+# EJFAT_URI is the older name and is still accepted.
+RECV_EJFAT_URI="${RECV_EJFAT_URI:-}"
 EJFAT_URI="${EJFAT_URI:-}"
+
+# Optional: instance URI of a second load balancer to forward built frames to.
+SEND_EJFAT_URI="${SEND_EJFAT_URI:-}"
+SEND_DATA_ID="${SEND_DATA_ID:-}"
+SEND_SRC_ID="${SEND_SRC_ID:-}"
+SEND_SENDER_IP="${SEND_SENDER_IP:-}"
+SEND_EVENT_OFFSET="${SEND_EVENT_OFFSET:-}"
+SEND_PARTIAL_FRAMES="${SEND_PARTIAL_FRAMES:-}"
+SEND_MTU="${SEND_MTU:-}"
+SEND_SOCKETS="${SEND_SOCKETS:-}"
+SEND_BUFSIZE="${SEND_BUFSIZE:-}"
+SEND_RATE="${SEND_RATE:-}"
+SEND_IPV6="${SEND_IPV6:-0}"
+SEND_QUEUE_FRAMES="${SEND_QUEUE_FRAMES:-}"
+SEND_QUEUE_BYTES="${SEND_QUEUE_BYTES:-}"
+SEND_OVERFLOW="${SEND_OVERFLOW:-}"
+SEND_BLOCK_TIMEOUT="${SEND_BLOCK_TIMEOUT:-}"
+SEND_DRAIN_TIMEOUT="${SEND_DRAIN_TIMEOUT:-}"
 
 # Receiver network
 RECEIVER_IP="${RECEIVER_IP:-}"
@@ -107,6 +128,10 @@ FILE_EXTENSION="${FILE_EXTENSION:-}"
 VERBOSE_FRAMES="${VERBOSE_FRAMES:-0}"
 VERBOSE_REASSEMBLE="${VERBOSE_REASSEMBLE:-0}"
 REPORT_INTERVAL="${REPORT_INTERVAL:-}"
+# Prometheus endpoint: unset/0 = off. METRICS_BIND defaults to 127.0.0.1 in
+# coda-fb; set 0.0.0.0 (or the host address) for a remote Prometheus.
+METRICS_PORT="${METRICS_PORT:-}"
+METRICS_BIND="${METRICS_BIND:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # Seconds to let coda-fb shut down cleanly after SIGINT before escalating to
@@ -125,8 +150,19 @@ is_true() {
 # ---------------------------------------------------------------------------
 if [[ "$RAW_MODE" == "0" ]]; then
 
-[[ -n "$EJFAT_URI" ]] || die "EJFAT_URI is required (the EJFAT control-plane URI).
-  Example: -e EJFAT_URI='ejfat://token@cp-host:18347/lb/1?data=10.0.0.5:10000'"
+if [[ -n "$RECV_EJFAT_URI" && -n "$EJFAT_URI" ]]; then
+    die "set RECV_EJFAT_URI or the older EJFAT_URI, not both"
+fi
+if [[ -z "$RECV_EJFAT_URI" && -n "$EJFAT_URI" ]]; then
+    warn "EJFAT_URI is deprecated, use RECV_EJFAT_URI (same meaning)"
+    RECV_EJFAT_URI="$EJFAT_URI"
+fi
+[[ -n "$RECV_EJFAT_URI" ]] || die "RECV_EJFAT_URI is required (instance URI of the load balancer to receive from).
+  Example: -e RECV_EJFAT_URI='ejfats://token@cp-host:18347/lb/1?data=10.0.0.5&sync=10.0.0.5:19010'"
+
+if [[ -n "$SEND_EJFAT_URI" ]] && ! is_true "$ENABLE_FRAMEBUILD"; then
+    die "SEND_EJFAT_URI forwards built frames and needs ENABLE_FRAMEBUILD=1"
+fi
 
 if is_true "$AUTO_IP"; then
     [[ -z "$RECEIVER_IP" ]] || die "set RECEIVER_IP or AUTO_IP=1, not both"
@@ -138,8 +174,8 @@ else
 fi
 
 if is_true "$ENABLE_FRAMEBUILD"; then
-    if [[ -z "$ET_FILE" && -z "$FB_OUTPUT_DIR" ]]; then
-        die "frame building needs at least one output: set ET_FILE and/or FB_OUTPUT_DIR"
+    if [[ -z "$ET_FILE" && -z "$FB_OUTPUT_DIR" && -z "$SEND_EJFAT_URI" ]]; then
+        die "frame building needs at least one output: set ET_FILE, FB_OUTPUT_DIR and/or SEND_EJFAT_URI"
     fi
     if [[ -n "$FB_OUTPUT_DIR" ]]; then
         mkdir -p "$FB_OUTPUT_DIR" 2>/dev/null || true
@@ -215,11 +251,11 @@ trap stop_et EXIT
 args=()
 
 if [[ "$RAW_MODE" == "1" ]]; then
-    log "raw mode: --uri given on the command line, environment not consulted"
+    log "raw mode: receive URI given on the command line, environment not consulted"
     args=("$@")
 else
 
-args=(--uri "$EJFAT_URI")
+args=(--recv-ejfat-uri "$RECV_EJFAT_URI")
 
 if is_true "$AUTO_IP"; then
     args+=(--autoip)
@@ -241,6 +277,8 @@ fi
 [[ -n "$BUFSIZE" ]]         && args+=(--bufsize "$BUFSIZE")
 [[ -n "$RECV_TIMEOUT" ]]    && args+=(--timeout "$RECV_TIMEOUT")
 [[ -n "$REPORT_INTERVAL" ]] && args+=(--report-interval "$REPORT_INTERVAL")
+[[ -n "$METRICS_PORT" ]]    && args+=(--metrics-port "$METRICS_PORT")
+[[ -n "$METRICS_BIND" ]]    && args+=(--metrics-bind "$METRICS_BIND")
 
 is_true "$PREFER_IPV6"     && args+=(--ipv6)
 is_true "$TLS_NOVALIDATE"  && args+=(--novalidate)
@@ -257,6 +295,25 @@ if is_true "$ENABLE_FRAMEBUILD"; then
     [[ -n "$ET_HOST" ]]           && args+=(--et-host "$ET_HOST")
     [[ -n "$ET_PORT" ]]           && args+=(--et-port "$ET_PORT")
     [[ -n "$ET_EVENT_SIZE" ]]     && args+=(--et-event-size "$ET_EVENT_SIZE")
+    if [[ -n "$SEND_EJFAT_URI" ]]; then
+        args+=(--send-ejfat-uri "$SEND_EJFAT_URI")
+        [[ -n "$SEND_DATA_ID" ]]        && args+=(--send-data-id "$SEND_DATA_ID")
+        [[ -n "$SEND_SRC_ID" ]]         && args+=(--send-src-id "$SEND_SRC_ID")
+        # shellcheck disable=SC2206
+        [[ -n "$SEND_SENDER_IP" ]]      && args+=(--send-sender-ip $SEND_SENDER_IP)
+        [[ -n "$SEND_EVENT_OFFSET" ]]   && args+=(--send-event-offset "$SEND_EVENT_OFFSET")
+        [[ -n "$SEND_PARTIAL_FRAMES" ]] && args+=(--send-partial-frames "$SEND_PARTIAL_FRAMES")
+        [[ -n "$SEND_MTU" ]]            && args+=(--send-mtu "$SEND_MTU")
+        [[ -n "$SEND_SOCKETS" ]]        && args+=(--send-sockets "$SEND_SOCKETS")
+        [[ -n "$SEND_BUFSIZE" ]]        && args+=(--send-bufsize "$SEND_BUFSIZE")
+        [[ -n "$SEND_RATE" ]]           && args+=(--send-rate "$SEND_RATE")
+        [[ -n "$SEND_QUEUE_FRAMES" ]]   && args+=(--send-queue-frames "$SEND_QUEUE_FRAMES")
+        [[ -n "$SEND_QUEUE_BYTES" ]]    && args+=(--send-queue-bytes "$SEND_QUEUE_BYTES")
+        [[ -n "$SEND_OVERFLOW" ]]       && args+=(--send-overflow "$SEND_OVERFLOW")
+        [[ -n "$SEND_BLOCK_TIMEOUT" ]]  && args+=(--send-block-timeout "$SEND_BLOCK_TIMEOUT")
+        [[ -n "$SEND_DRAIN_TIMEOUT" ]]  && args+=(--send-drain-timeout "$SEND_DRAIN_TIMEOUT")
+        is_true "$SEND_IPV6"            && args+=(--send-ipv6)
+    fi
 else
     args+=(--enable-framebuild=0)
     args+=(--output-dir "$OUTPUT_DIR")
@@ -288,8 +345,10 @@ shutdown() {
 
     # coda-fb installs a handler for SIGINT only (signal(SIGINT, ctrlCHandler)).
     # That handler deregisters the worker from the EJFAT load balancer before
-    # any blocking shutdown call, drains the builder threads and prints final
-    # statistics -- so SIGTERM must be translated, and the result given time.
+    # any blocking shutdown call, drains the builder threads and the frames
+    # being forwarded (up to SEND_DRAIN_TIMEOUT, default 10 s), removes the
+    # sender registration on the second LB and prints final statistics -- so
+    # SIGTERM must be translated, and the result given time.
     log "forwarding shutdown to coda-fb as SIGINT (pid $CODA_FB_PID)"
     kill -INT "$CODA_FB_PID" 2>/dev/null || true
 
@@ -310,7 +369,8 @@ trap shutdown TERM INT
 
 start_et
 
-log "exec: coda-fb ${args[*]}"
+# The URIs carry instance tokens; never write those to the container log.
+log "exec: coda-fb $(sed -E 's#([A-Za-z][A-Za-z0-9+.-]*://)[^@/ ]*@#\1<redacted>@#g' <<< "${args[*]}")"
 coda-fb "${args[@]}" &
 CODA_FB_PID=$!
 
