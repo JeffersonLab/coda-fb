@@ -57,6 +57,9 @@ meson setup builddir --buildtype=release
 # Compile
 meson compile -C builddir
 
+# Test (optional; builds and runs the tests, see Testing)
+meson test -C builddir
+
 # Install
 meson install -C builddir
 ```
@@ -73,23 +76,105 @@ install to `/usr/local/bin`; it falls through to `$CODA` or `~/.local`.
 
 See [`scripts/README.md`](scripts/README.md) for the convenience build/run wrappers.
 
-### Docker
+### Docker: build, ship and run on a remote node
 
-A self-contained image is available for deployment to remote hosts without
-installing E2SAR, ET or the Boost/gRPC stack there:
+The image is self-contained: the Docker build compiles ET, E2SAR (v0.4.0rc1) and coda-fb inside
+the container, so no separate compile step is needed and the remote node only needs Docker — not
+E2SAR, ET or the Boost/gRPC stack.
+
+**1. Build the image** on an **x86_64 Linux** machine. The image is `linux/amd64` because
+E2SAR's dependency bundle exists only for amd64; building on Apple Silicon falls back to emulation
+and is impractically slow (and can run out of memory compiling E2SAR).
 
 ```bash
-./docker/build.sh --tag coda-fb:v1.0.0
-
-docker run -d --network host -v /data/frames:/data \
-  -e RECV_EJFAT_URI='ejfats://token@cp-host:18347/lb/1?data=10.0.0.1&sync=10.0.0.1:19010' \
-  -e RECEIVER_IP=10.0.0.5 -e THREADS=4 -e EXPECTED_STREAMS=3 \
-  coda-fb:v1.0.0
+git clone https://github.com/JeffersonLab/coda-fb.git && cd coda-fb
+./docker/build.sh --tag coda-fb:v1.1.0
 ```
 
-Host networking is required, and `docker stop -t 90` is needed so the load
-balancer deregistration completes. See [`docker/README.md`](docker/README.md)
-for the full parameter list, ET options, and registry/tarball deployment.
+Useful `build.sh` options: `--save FILE` (also write a gzipped tarball), `--push REGISTRY` (tag
+into a registry and push), `--no-cache`, `--buildtype` (default `release`), and `--e2sar-ref`,
+`--e2sar-deps-ver`, `--et-ref` to pin versions (defaults v0.4.0rc1 and v16.6.0). The build fails
+early if the frame builder was not compiled in or the binary cannot run. The build context is the
+working tree, so uncommitted changes are included.
+
+**2. Ship it to the remote node**, as a tarball or through a registry:
+
+```bash
+# tarball
+./docker/build.sh --tag coda-fb:v1.1.0 --save coda-fb-v1.1.0.tar.gz
+scp coda-fb-v1.1.0.tar.gz remote:/tmp/
+ssh remote 'gunzip -c /tmp/coda-fb-v1.1.0.tar.gz | docker load'
+
+# or a registry
+./docker/build.sh --tag coda-fb:v1.1.0 --push <dockerhub-user>
+ssh remote docker pull <dockerhub-user>/coda-fb:v1.1.0
+```
+
+**3. Run it on the remote node.** `--network host` is required: coda-fb registers its IP with
+the load balancer, which sends UDP straight to it. Stop it with `docker stop -t 90` (or longer)
+so the LB deregistration and the drain of forwarded frames complete; the container is given
+`SHUTDOWN_GRACE` (default 60 s) before being killed.
+
+Frame building to EVIO files (`ENABLE_FRAMEBUILD=1` and `FB_OUTPUT_DIR=/data` are the container
+defaults, so mount a host directory on `/data`):
+
+```bash
+docker run -d --name coda-fb --network host -v /data/frames:/data \
+  -e RECV_EJFAT_URI='ejfats://<token>@<cp-host>:18347/lb/<id>?data=10.0.0.1&sync=10.0.0.1:19010' \
+  -e RECEIVER_IP=10.0.0.5 -e THREADS=4 -e EXPECTED_STREAMS=3 \
+  coda-fb:v1.1.0
+```
+
+Also forwarding to a second load balancer, with Prometheus metrics:
+
+```bash
+docker run -d --name coda-fb --network host -v /data/frames:/data \
+  -e RECV_EJFAT_URI="$LB1_URI" -e SEND_EJFAT_URI="$LB2_URI" \
+  -e RECEIVER_IP=10.0.0.5 -e THREADS=4 -e EXPECTED_STREAMS=3 \
+  -e METRICS_PORT=9465 \
+  coda-fb:v1.1.0
+```
+
+Raw flags instead of environment variables: if `--recv-ejfat-uri` (or the deprecated `--uri`) is
+on the command line, the environment is not consulted:
+
+```bash
+docker run -d --name coda-fb --network host -v /data/frames:/data coda-fb:v1.1.0 \
+  --recv-ejfat-uri "$LB1_URI" --ip 10.0.0.5 --threads 4 \
+  --enable-framebuild=1 --expected-streams 3 --fb-output-dir /data
+```
+
+Managing it:
+
+```bash
+docker logs -f coda-fb                    # statistics report every 5 s
+docker stop -t 90 coda-fb                 # clean shutdown (SIGTERM is turned into SIGINT)
+docker run --rm coda-fb:v1.1.0 --help     # all options
+docker run --rm -v /data/frames:/data coda-fb:v1.1.0 \
+  evio_event_parser /data/frames_thread0_file0000.evio    # validate the output
+```
+
+With Docker Compose instead (host networking, stop grace period and log rotation are preset):
+
+```bash
+cp docker/coda-fb.env.example coda-fb.env && $EDITOR coda-fb.env
+docker compose -f docker/docker-compose.yml up -d
+```
+
+Notes:
+
+- Set `FB_OUTPUT_DIR=` (empty) for an ET-only or forward-only run.
+- ET: `ET_FILE` with `ET_HOST`/`ET_PORT` for an external ET system, or `RUN_ET_START=1` with
+  `--ipc=host` to start one inside the container.
+- When forwarding, keep `SHUTDOWN_GRACE` (and `docker stop -t`) comfortably above
+  `SEND_DRAIN_TIMEOUT` (default 10 s).
+- The URIs carry instance tokens: keep them in an env file with mode `600`, not in shell history.
+  coda-fb and the entrypoint never print them.
+- To watch a live dashboard of a remote coda-fb, see
+  [`doc/monitoring.md`](doc/monitoring.md) section 6.5.
+
+[`docker/README.md`](docker/README.md) has the full list of environment variables, ET details,
+Perlmutter (podman-hpc/Shifter) instructions and troubleshooting.
 
 ## Usage
 
