@@ -53,9 +53,19 @@ E2SAR and ET are not packaged; build and install them separately. If ET does not
 > **Preferred:** build inside the Docker image. The image bundles ET, E2SAR
 > 0.4.0rc1 and the pinned `e2sar-deps` stack (Boost 1.89.0, gRPC 1.74.1, protobuf,
 > Abseil), so the host only needs Docker — none of the dependencies above have to
-> be installed or match a specific version. One-liner (build + push to Docker Hub):
+> be installed or match a specific version.
+>
+> **Host requirement:** build on **x86_64 Linux** with Docker (or rootless
+> Podman) installed. The image is `linux/amd64` only because the `e2sar-deps`
+> bundle is published only for amd64; Apple Silicon / arm64 falls back to QEMU
+> emulation and is impractically slow (the E2SAR compile can OOM). The resulting
+> image also runs on `linux/amd64` only.
+>
+> One-liner (build + push to Docker Hub; `build.sh` auto-fetches the ~76 MB
+> `e2sar-deps` deb into the build context on first run):
 >
 > ```bash
+> docker login
 > ./docker/build.sh --tag coda-fb:v1.1.0 --push <dockerhub-user>
 > ```
 >
