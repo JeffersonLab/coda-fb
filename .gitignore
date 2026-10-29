@@ -22,3 +22,6 @@ compile_commands.json
 
 # macOS Finder metadata
 .DS_Store
+
+# Pre-downloaded E2SAR dependency bundle (fetched locally before docker build)
+docker/e2sar-deps_*_amd64.deb

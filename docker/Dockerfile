@@ -64,8 +64,12 @@ RUN pip3 install --no-cache-dir meson pybind11
 # Create it so the rpath resolves even when the deps land in /usr/local/lib.
 RUN mkdir -p /usr/local/lib64
 
-RUN wget -q -O /tmp/e2sar-deps.deb "${E2SAR_DEPS_URL}" \
-    && dpkg -i /tmp/e2sar-deps.deb \
+# Pre-downloaded on the host and copied in, instead of fetching from GitHub during
+# the build. This avoids rootless podman/slirp4netns network flakiness and TLS
+# issues inside the container, and makes rebuilds reproducible when offline.
+# The file name must match E2SAR_DEPS_VER (default 0.4.0rc1).
+COPY docker/e2sar-deps_${E2SAR_DEPS_VER}_amd64.deb /tmp/e2sar-deps.deb
+RUN dpkg -i /tmp/e2sar-deps.deb \
     && rm -f /tmp/e2sar-deps.deb \
     && ldconfig
 
