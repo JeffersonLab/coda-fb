@@ -50,6 +50,21 @@ E2SAR and ET are not packaged; build and install them separately. If ET does not
 
 ## Build
 
+> **Preferred:** build inside the Docker image. The image bundles ET, E2SAR
+> 0.4.0rc1 and the pinned `e2sar-deps` stack (Boost 1.89.0, gRPC 1.74.1, protobuf,
+> Abseil), so the host only needs Docker — none of the dependencies above have to
+> be installed or match a specific version. One-liner (build + push to Docker Hub):
+>
+> ```bash
+> ./docker/build.sh --tag coda-fb:v1.1.0 --push <dockerhub-user>
+> ```
+>
+> This produces `<dockerhub-user>/coda-fb:v1.1.0` on Docker Hub. See
+> [Docker: build, ship and run on a remote node](#docker-build-ship-and-run-on-a-remote-node)
+> for details and alternatives (tarball, custom registry).
+
+Native build (requires the full dependency stack listed above):
+
 ```bash
 # Setup
 meson setup builddir --buildtype=release
