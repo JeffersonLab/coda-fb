@@ -74,6 +74,25 @@ done
 
 command -v docker > /dev/null 2>&1 || fail "docker not found on PATH"
 
+# Fetch the E2SAR dependency bundle into the build context if it is not already
+# there. The Dockerfile COPYs this file in rather than wget-ing it inside the
+# container, which avoids rootless-podman network/TLS flakiness and keeps
+# rebuilds reproducible when offline. .gitignore keeps the file out of git.
+DEPS_DEB_URL="https://github.com/JeffersonLab/E2SAR/releases/download/E2SAR-${E2SAR_DEPS_VER}-main-${E2SAR_DEPS_DISTRO}/e2sar-deps_${E2SAR_DEPS_VER}_amd64.deb"
+DEPS_DEB_PATH="${PROJECT_DIR}/docker/e2sar-deps_${E2SAR_DEPS_VER}_amd64.deb"
+if [[ ! -s "$DEPS_DEB_PATH" ]]; then
+    info "Fetching e2sar-deps ${E2SAR_DEPS_VER} (${E2SAR_DEPS_DISTRO}) into the build context"
+    if command -v curl > /dev/null 2>&1; then
+        curl -L --fail --progress-bar -o "$DEPS_DEB_PATH" "$DEPS_DEB_URL" \
+            || { rm -f "$DEPS_DEB_PATH"; fail "download failed: $DEPS_DEB_URL"; }
+    elif command -v wget > /dev/null 2>&1; then
+        wget -O "$DEPS_DEB_PATH" "$DEPS_DEB_URL" \
+            || { rm -f "$DEPS_DEB_PATH"; fail "download failed: $DEPS_DEB_URL"; }
+    else
+        fail "neither curl nor wget found; fetch $DEPS_DEB_URL manually to $DEPS_DEB_PATH"
+    fi
+fi
+
 # The E2SAR dependency bundle is published for amd64 only, so the image must be
 # built for linux/amd64 regardless of the host. On Apple Silicon and other arm64
 # hosts that means emulation, which is slow for the E2SAR compile.
