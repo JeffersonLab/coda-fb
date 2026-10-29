@@ -565,6 +565,73 @@ Grafana dashboard are in [`doc/monitoring.md`](doc/monitoring.md) and
 forwarding) are not exported, and E2SAR's own families appear once startup has created the
 reassembler and segmenter.
 
+### Live dashboard of a coda-fb on a remote host
+
+Run Prometheus and Grafana on the remote host next to coda-fb, keep every port bound to
+localhost there, and view Grafana from your own machine through an SSH tunnel. Nothing is exposed
+on the network; your machine needs only `ssh` and a browser.
+
+```
+your laptop                            remote host
+browser ──ssh -L 3000──────────────►   Grafana     127.0.0.1:3000
+                                         └─► Prometheus  127.0.0.1:9090
+                                               └─► coda-fb /metrics 127.0.0.1:9465
+```
+
+1. **Build and ship the image** as in
+   [Docker: build, ship and run on a remote node](#docker-build-ship-and-run-on-a-remote-node).
+
+2. **Copy the monitoring files**: the whole `doc/monitoring/` directory, since the stack loads the
+   alert rules and the dashboard from its parent directory:
+
+   ```bash
+   scp -r doc/monitoring remote:~/coda-fb-monitoring
+   ```
+
+   If the remote host cannot pull from Docker Hub, ship those images too:
+   `docker save prom/prometheus:v2.53.0 grafana/grafana:11.1.0 | gzip > monitoring-images.tar.gz`.
+
+3. **Run coda-fb with metrics on**, on the remote host. The endpoint binds to localhost by
+   default, which is what this setup needs:
+
+   ```bash
+   docker run -d --name coda-fb --network host -v /data/frames:/data \
+     -e RECV_EJFAT_URI="$LB1_URI" -e SEND_EJFAT_URI="$LB2_URI" \
+     -e RECEIVER_IP=10.0.0.5 -e THREADS=4 -e EXPECTED_STREAMS=3 \
+     -e METRICS_PORT=9465 \
+     coda-fb:v1.1.0
+   curl -s localhost:9465/metrics | grep coda_fb_ready    # quick check on the host
+   ```
+
+   With `docker/docker-compose.yml`, put `METRICS_PORT=9465` in `coda-fb.env` instead.
+
+4. **Start Prometheus and Grafana** on the remote host, listening on localhost only:
+
+   ```bash
+   cd ~/coda-fb-monitoring/stack          # prometheus.yml already targets localhost:9465
+   PROMETHEUS_LISTEN=127.0.0.1:9090 GRAFANA_LISTEN_ADDR=127.0.0.1 \
+   GRAFANA_ADMIN_PASSWORD='choose-one' docker compose up -d
+   ```
+
+5. **Open the tunnel** from your machine and browse:
+
+   ```bash
+   ssh -N -L 3000:localhost:3000 -L 9090:localhost:9090 user@remote
+   # through a gateway: ssh -N -J user@gateway -L 3000:localhost:3000 -L 9090:localhost:9090 user@remote
+   ```
+
+   Open <http://localhost:3000> and log in as `admin` with the password from step 4. The home page
+   is the **coda-fb pipeline** dashboard, refreshing every 10 s. <http://localhost:9090> is
+   Prometheus (targets, alerts, queries). If a port is busy on your laptop, tunnel another one,
+   e.g. `-L 13000:localhost:3000`.
+
+The stack keeps recording while you are disconnected (30 days of history). For several coda-fb
+hosts, run the stack once on a monitoring host instead, start each coda-fb with `METRICS_BIND`
+set to an address that host can reach (firewalled to it), and list them in
+`doc/monitoring/stack/prometheus.yml`. Details, the Docker Desktop variant, a loopback demo
+without EJFAT and a screenshot of the dashboard are in [`doc/monitoring.md`](doc/monitoring.md),
+sections 6.1–6.5.
+
 ## Testing
 
 ```bash
