@@ -391,6 +391,60 @@ graphs 5–10 minutes: the rate panels use 1–5 minute windows. The socket buff
 200 kB to fit Linux's default `net.core.[rw]mem_max`; at higher rates raise those sysctls and the
 `--bufsize`/`--send-bufsize` options together.
 
+#### Running the demo with the Docker image
+
+The same demo on a host that runs coda-fb from the Docker image (README, "Docker: build, ship
+and run on a remote node"), from the top of a coda-fb checkout. The runtime image carries only
+`coda-fb`, so the traffic generator is compiled once in the image's `build` stage, which Docker
+has cached from the image build. Run it in the checkout where `docker/build.sh` ran, so the
+E2SAR deps bundle it fetched (`docker/e2sar-deps_<ver>_amd64.deb`) is in the build context.
+Replace `coda-fb:v1.1.0` with your tag.
+
+```bash
+# 0. once: an image with the build tree and the traffic generator compiled in it
+docker build --target build -t coda-fb:build -f docker/Dockerfile .
+docker run --name lbgen-build coda-fb:build \
+    meson compile -C /src/coda-fb/builddir loopback_traffic
+docker commit lbgen-build coda-fb:loopback && docker rm lbgen-build
+
+# 1. coda-fb: receiving on :21000, forwarding to :22000, metrics on :9465
+docker run -d --name coda-fb --network host coda-fb:v1.1.0 \
+    --recv-ejfat-uri 'ejfat://demo@127.0.0.1:18347/lb/1?data=127.0.0.1' --withcp=0 \
+    --ip 127.0.0.1 --port 21000 --threads 1 --bufsize 200000 \
+    --enable-framebuild=1 --expected-streams 3 --frame-timeout 200 \
+    --send-ejfat-uri 'ejfat://demo@127.0.0.2:18347/lb/2?data=127.0.0.1:22000' --send-nocp \
+    --send-warmup 0 --send-bufsize 200000 --send-queue-frames 64 \
+    --metrics-port 9465
+
+# 2. simulated data: 3 ROC streams for 25 minutes, and the downstream drain
+docker run -d --name lbgen --network host coda-fb:loopback \
+    /src/coda-fb/builddir/test/loopback_traffic --streams 3 --seconds 1500 \
+    --min-hz 50 --max-hz 250 --period 180
+
+# 3. the stack (prometheus.yml already targets localhost:9465)
+cd doc/monitoring/stack && docker compose up -d
+```
+
+Check that data flows, then open the dashboard from your workstation through an SSH tunnel
+(Grafana `admin`/`admin`, dashboard **coda-fb pipeline**):
+
+```bash
+curl -s localhost:9465/metrics | grep coda_fb_build_frames   # counters increase
+docker logs -f lbgen                                         # frames= / drained= every 10 s
+
+# on your workstation
+ssh -L 3000:localhost:3000 -L 9090:localhost:9090 <remote-host>   # then http://localhost:3000
+```
+
+`docker stop lbgen` stops the input: the rate panels drop to zero at once, and `CodaFbNoInput` fires after about
+15 minutes (5-minute rate window plus `for: 10m`);
+a small `--send-queue-frames` (e.g. 4) exercises the forwarding queue panels. Clean up with
+`docker rm -f coda-fb lbgen` and `docker compose down -v` in `doc/monitoring/stack`.
+
+The containers use host networking, so ports 21000, 22000, 9465, 9090 and 3000 must be free on
+the host. If the image was built elsewhere and shipped, run step 0 on the build machine and ship
+`coda-fb:loopback` the same way; the host still needs `doc/monitoring/` for step 3.
+
 ### 6.3 The dashboard
 
 ![coda-fb pipeline dashboard, live data from the loopback demo](monitoring/dashboard.png)
